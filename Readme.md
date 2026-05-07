@@ -70,7 +70,8 @@ The binary is named `gdui` rather than `gd` because `gd` is a common alias for `
 | `g` / `G`                    | top / bottom                          |
 | `ctrl+u` / `ctrl+d`          | page up / down                        |
 | `a`                          | cycle view: changed → all → log       |
-| `esc` / `backspace`          | back out of a commit into the log     |
+| `b`                          | file history (on a file row)          |
+| `esc` / `backspace`          | back out of a commit, or out of file history |
 | `r`                          | refresh manually                      |
 | `?`                          | toggle help                           |
 | `q` / `ctrl+c`               | quit                                  |
@@ -84,6 +85,8 @@ Press <kbd>a</kbd> to cycle:
 1. **Changed** *(default)* — sparse tree of files with working-tree changes vs `HEAD`.
 2. **All** — every tracked file in the repo, with diff counts on changed ones.
 3. **Log** — the last 100 commits on the current branch. Select one with <kbd>enter</kbd> to open its file tree (commit vs parent; root and merge commits handled). <kbd>esc</kbd> / <kbd>backspace</kbd> returns to the log.
+
+From *changed* or *all*, press <kbd>b</kbd> on any file row to open a **file history** view — the commits that touched that file (renames followed via `git log --follow`). <kbd>enter</kbd> drills into a commit; <kbd>esc</kbd> returns to the file history, then again to the tree.
 
 ## What it shows
 

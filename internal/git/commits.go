@@ -27,9 +27,31 @@ func Log(repoRoot string, limit int) ([]Commit, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseLog(out), nil
+}
+
+// LogForPath returns up to `limit` most recent commits that touched `path`.
+// Uses --follow so the history extends across renames.
+func LogForPath(repoRoot, path string, limit int) ([]Commit, error) {
+	cmd := exec.Command("git", "-C", repoRoot, "-c", "core.quotepath=false",
+		"log",
+		"-n", strconv.Itoa(limit),
+		"--pretty=format:%H%x1f%h%x1f%an%x1f%ad%x1f%s",
+		"--date=short",
+		"--follow",
+		"--", path,
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	return parseLog(out), nil
+}
+
+func parseLog(out []byte) []Commit {
 	text := strings.TrimRight(string(out), "\n")
 	if text == "" {
-		return nil, nil
+		return nil
 	}
 	var commits []Commit
 	for _, line := range strings.Split(text, "\n") {
@@ -45,7 +67,7 @@ func Log(repoRoot string, limit int) ([]Commit, error) {
 			Subject:  parts[4],
 		})
 	}
-	return commits, nil
+	return commits
 }
 
 // CommitFiles returns the files changed in a single commit, with line counts

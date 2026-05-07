@@ -9,6 +9,7 @@ type keymap struct {
 	Refresh, Help, Quit               key.Binding
 	ToggleAll                         key.Binding
 	Back                              key.Binding
+	Blame                             key.Binding
 }
 
 var keys = keymap{
@@ -28,4 +29,5 @@ var keys = keymap{
 	Quit:      key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 	ToggleAll: key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "changed/all/log")),
 	Back:      key.NewBinding(key.WithKeys("esc", "backspace"), key.WithHelp("esc", "back")),
+	Blame:     key.NewBinding(key.WithKeys("b"), key.WithHelp("b", "file history")),
 }

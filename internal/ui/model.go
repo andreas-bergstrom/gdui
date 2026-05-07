@@ -30,6 +30,7 @@ const (
 	ModeAll
 	ModeLog
 	ModeCommit
+	ModeFileLog
 )
 
 func (m viewMode) String() string {
@@ -40,6 +41,8 @@ func (m viewMode) String() string {
 		return "log"
 	case ModeCommit:
 		return "commit"
+	case ModeFileLog:
+		return "file log"
 	default:
 		return "changed"
 	}
@@ -64,6 +67,11 @@ type Model struct {
 	selectedSHA     string
 	selectedShort   string
 	selectedSubject string
+
+	// file-log state — set when mode == ModeFileLog
+	fileLogPath  string
+	prevTreeMode viewMode // ModeChanged or ModeAll, to return to from ModeFileLog
+	commitParent viewMode // ModeLog or ModeFileLog, to return to from ModeCommit
 
 	vp       viewport.Model
 	width    int
@@ -140,6 +148,13 @@ func loadLogCmd(root string) tea.Cmd {
 	}
 }
 
+func loadFileLogCmd(root, path string) tea.Cmd {
+	return func() tea.Msg {
+		c, err := git.LogForPath(root, path, logLimit)
+		return logMsg{commits: c, err: err}
+	}
+}
+
 func loadCommitTreeCmd(root, sha string) tea.Cmd {
 	return func() tea.Msg {
 		files, err := git.CommitFiles(root, sha)
@@ -187,6 +202,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, loadStatusCmd(m.repoRoot, m.mode == ModeAll)
 		case ModeLog:
 			return m, loadLogCmd(m.repoRoot)
+		case ModeFileLog:
+			if m.fileLogPath != "" {
+				return m, loadFileLogCmd(m.repoRoot, m.fileLogPath)
+			}
 		}
 		// ModeCommit: a single commit's contents are immutable; nothing to do.
 		return m, nil
@@ -322,10 +341,13 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.mode == ModeCommit {
 			return *m, m.exitCommit()
 		}
+		if m.mode == ModeFileLog {
+			return *m, m.exitFileLog()
+		}
 		return *m, nil
 	}
 
-	if m.mode == ModeLog {
+	if m.mode == ModeLog || m.mode == ModeFileLog {
 		return m.handleKeyLog(msg)
 	}
 	return m.handleKeyTree(msg)
@@ -333,6 +355,12 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m *Model) handleKeyTree(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
+	case key.Matches(msg, keys.Blame):
+		n := m.currentNode()
+		if n == nil || n.IsDir || n.File == nil {
+			return *m, nil
+		}
+		return *m, m.openFileLog(n.Path)
 	case key.Matches(msg, keys.Down):
 		m.moveDown()
 	case key.Matches(msg, keys.Up):
@@ -466,7 +494,7 @@ func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	if msg.Action != tea.MouseActionPress || msg.Button != tea.MouseButtonLeft {
 		return *m, nil
 	}
-	if m.mode == ModeLog {
+	if m.mode == ModeLog || m.mode == ModeFileLog {
 		for i := range m.commits {
 			if z := m.zones.Get(commitZoneID(i)); z.InBounds(msg) {
 				m.commitCursor = i
@@ -519,9 +547,10 @@ func (m *Model) cycleMode() tea.Cmd {
 		}
 		m.refreshView()
 		return nil
-	case ModeLog, ModeCommit:
+	case ModeLog, ModeCommit, ModeFileLog:
 		m.mode = ModeChanged
 		m.clearSelectedCommit()
+		m.fileLogPath = ""
 		return loadStatusCmd(m.repoRoot, false)
 	}
 	return nil
@@ -532,6 +561,7 @@ func (m *Model) openCommit() tea.Cmd {
 		return nil
 	}
 	c := m.commits[m.commitCursor]
+	m.commitParent = m.mode
 	m.mode = ModeCommit
 	m.selectedSHA = c.SHA
 	m.selectedShort = c.ShortSHA
@@ -543,11 +573,41 @@ func (m *Model) openCommit() tea.Cmd {
 }
 
 func (m *Model) exitCommit() tea.Cmd {
-	m.mode = ModeLog
+	parent := m.commitParent
+	if parent != ModeLog && parent != ModeFileLog {
+		parent = ModeLog
+	}
+	m.mode = parent
 	m.clearSelectedCommit()
 	m.vp.SetYOffset(0)
 	m.refreshView()
 	return nil
+}
+
+func (m *Model) openFileLog(path string) tea.Cmd {
+	m.prevTreeMode = m.mode
+	m.mode = ModeFileLog
+	m.fileLogPath = path
+	m.resetTree()
+	m.commits = nil
+	m.commitCursor = 0
+	m.logLoaded = false
+	m.vp.SetYOffset(0)
+	m.refreshView()
+	return loadFileLogCmd(m.repoRoot, path)
+}
+
+func (m *Model) exitFileLog() tea.Cmd {
+	prev := m.prevTreeMode
+	if prev != ModeChanged && prev != ModeAll {
+		prev = ModeChanged
+	}
+	m.mode = prev
+	m.fileLogPath = ""
+	m.commits = nil
+	m.logLoaded = false
+	m.vp.SetYOffset(0)
+	return loadStatusCmd(m.repoRoot, prev == ModeAll)
 }
 
 func (m *Model) refreshCmd() tea.Cmd {
@@ -558,6 +618,10 @@ func (m *Model) refreshCmd() tea.Cmd {
 		return loadStatusCmd(m.repoRoot, true)
 	case ModeLog:
 		return loadLogCmd(m.repoRoot)
+	case ModeFileLog:
+		if m.fileLogPath != "" {
+			return loadFileLogCmd(m.repoRoot, m.fileLogPath)
+		}
 	case ModeCommit:
 		if m.selectedSHA != "" {
 			return loadCommitTreeCmd(m.repoRoot, m.selectedSHA)
@@ -711,7 +775,7 @@ func (m *Model) refreshView() {
 		return
 	}
 	m.recomputeViewportHeight()
-	if m.mode == ModeLog {
+	if m.mode == ModeLog || m.mode == ModeFileLog {
 		if m.commitCursor >= len(m.commits) {
 			m.commitCursor = len(m.commits) - 1
 		}
@@ -745,7 +809,7 @@ func (m *Model) refreshViewToCursor() {
 	if !m.ready {
 		return
 	}
-	if m.mode == ModeLog {
+	if m.mode == ModeLog || m.mode == ModeFileLog {
 		m.ensureCommitCursorVisible()
 		return
 	}
@@ -829,7 +893,12 @@ func (m Model) View() string {
 	}
 	header := m.fitWidth(m.header())
 	footer := m.fitWidth(m.footer())
-	body := m.vp.View()
+	var body string
+	if m.showHelp {
+		body = m.renderHelpBody()
+	} else {
+		body = m.vp.View()
+	}
 	return m.zones.Scan(lipgloss.JoinVertical(lipgloss.Left, header, body, footer))
 }
 
@@ -839,13 +908,17 @@ func (m Model) header() string {
 		crumb := dimStyle.Render(m.selectedShort + " " + truncate(m.selectedSubject, max(20, m.width-20)))
 		return lipgloss.JoinHorizontal(lipgloss.Left, title, " ", crumb)
 	}
+	if m.mode == ModeFileLog && m.fileLogPath != "" {
+		crumb := dimStyle.Render("log: " + m.fileLogPath)
+		return lipgloss.JoinHorizontal(lipgloss.Left, title, " ", crumb)
+	}
 	repo := dimStyle.Render(m.repoRoot)
 	return lipgloss.JoinHorizontal(lipgloss.Left, title, " ", repo)
 }
 
 func (m Model) footer() string {
 	if m.showHelp {
-		return helpStyle.Render("j/k move · enter open/toggle · esc back · a changed/all/log · r refresh · q quit")
+		return helpStyle.Render("? close help · q quit")
 	}
 	if m.err != nil {
 		return errStyle.Render("error: " + m.err.Error())
@@ -853,6 +926,10 @@ func (m Model) footer() string {
 	if m.mode == ModeLog {
 		left := fmt.Sprintf("[log] %d commits", len(m.commits))
 		return helpStyle.Render(left + " · enter open · a toggle · ? help")
+	}
+	if m.mode == ModeFileLog {
+		left := fmt.Sprintf("[file log] %d commits · %s", len(m.commits), m.fileLogPath)
+		return helpStyle.Render(left + " · enter open · esc back · ? help")
 	}
 
 	// ModeChanged / ModeAll / ModeCommit all show file count + adds/dels totals.
@@ -1022,6 +1099,75 @@ func (m *Model) renderExpanded(n *tree.Node) string {
 		cursor = m.diffCursor
 	}
 	return render.Hunks(n.Path, n.Hunks, m.width, cursor)
+}
+
+func (m *Model) renderHelpBody() string {
+	type row struct{ key, desc string }
+	sections := []struct {
+		title string
+		rows  []row
+	}{
+		{"Navigation", []row{
+			{"j / ↓", "move cursor down"},
+			{"k / ↑", "move cursor up"},
+			{"h / ←", "collapse (or jump to parent)"},
+			{"l / →", "expand"},
+			{"[ / ]", "previous / next folder"},
+			{"g / G", "top / bottom"},
+			{"ctrl+u / ctrl+d", "page up / down"},
+		}},
+		{"Open & inspect", []row{
+			{"enter / space", "toggle expand/collapse (or open commit)"},
+			{"b", "file history (commits touching this file)"},
+			{"left-click row", "toggle expand/collapse"},
+			{"scroll wheel", "scroll viewport"},
+		}},
+		{"Modes", []row{
+			{"a", "cycle view: changed → all → log"},
+			{"esc / backspace", "back out of commit or file history"},
+		}},
+		{"Misc", []row{
+			{"r", "refresh manually"},
+			{"?", "toggle this help"},
+			{"q / ctrl+c", "quit"},
+		}},
+	}
+
+	keyW := 0
+	for _, s := range sections {
+		for _, r := range s.rows {
+			if len(r.key) > keyW {
+				keyW = len(r.key)
+			}
+		}
+	}
+
+	keyStyle := headerStyle
+	titleStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#bb9af7")).Bold(true)
+
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("  gd — keys"))
+	b.WriteString("\n")
+	for _, s := range sections {
+		b.WriteString("\n  ")
+		b.WriteString(titleStyle.Render(s.title))
+		b.WriteString("\n")
+		for _, r := range s.rows {
+			padded := r.key + strings.Repeat(" ", keyW-len(r.key))
+			line := "    " + keyStyle.Render(padded) + "  " + fileStyle.Render(r.desc)
+			b.WriteString(m.fitWidth(line))
+			b.WriteByte('\n')
+		}
+	}
+
+	out := strings.TrimRight(b.String(), "\n")
+	if m.vp.Height > 0 {
+		lines := strings.Count(out, "\n") + 1
+		if pad := m.vp.Height - lines; pad > 0 {
+			out += strings.Repeat("\n", pad)
+		}
+	}
+	return out
 }
 
 func zoneID(i int) string       { return fmt.Sprintf("row-%d", i) }
