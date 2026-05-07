@@ -2,21 +2,7 @@
 
 A focused terminal UI for browsing your working-tree git diff as a sparse, collapsible file tree with inline syntax-highlighted diffs. Built to live in a narrow sidebar pane next to an agent like Claude Code, so you can see at a glance what's been changed without context-switching to a pager.
 
-```
- gdui  /Users/you/proj
-▾ lib/                    +12 -3
-  ▾ M util.go             +12 -3
-    @@ -1,5 +1,14 @@
-     package lib
-    +
-    +func Sub(a, b int) int {
-    +    return a - b
-    +}
-     ...
-▸ src/                    +9  -2
-▸ ? NEW.txt               +1  -0
-▸ D readme.md             +0  -2
-```
+![gdui screenshot](docs/screenshot.png)
 
 ## Features
 
