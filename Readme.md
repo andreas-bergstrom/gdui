@@ -22,10 +22,20 @@ A focused terminal UI for browsing your working-tree git diff as a sparse, colla
 
 - **Sparse tree** — only changed paths appear; single-child directory chains are collapsed (`src/foo/bar/`).
 - **Inline expansion** — press <kbd>enter</kbd> on a file to reveal the syntax-highlighted unified diff under the row, no pager handoff.
-- **Live updates** — fsnotify-backed file watcher refreshes the tree on disk changes (200 ms debounce). Useful when an agent is editing files in another pane.
+- **Three view modes** — cycle with <kbd>a</kbd> between *changed only*, *all tracked files*, and *commit log*; pick a commit to drill into its file tree.
+- **Live updates** — fsnotify-backed file watcher refreshes the tree on disk changes (200 ms debounce), and refreshes the log view when a new commit lands. Useful when an agent is editing files or committing in another pane.
 - **Keyboard + mouse** — vim-style navigation; click rows to toggle, scroll-wheel to scroll.
 - **Status-aware markers** — `M` modified, `A` added, `D` deleted, `R` renamed, `?` untracked.
 - **Single static binary** — shells out to the `git` CLI; no library needed.
+
+## Built with
+
+- [Bubble Tea](https://github.com/charmbracelet/bubbletea) — TUI runtime
+- [Bubbles](https://github.com/charmbracelet/bubbles) — viewport component
+- [Lip Gloss](https://github.com/charmbracelet/lipgloss) — styling
+- [bubblezone](https://github.com/lrstanley/bubblezone) — mouse hit-testing for tree rows
+- [Chroma](https://github.com/alecthomas/chroma) — syntax highlighting
+- [fsnotify](https://github.com/fsnotify/fsnotify) — recursive file watching
 
 ## Install
 
@@ -53,16 +63,27 @@ The binary is named `gdui` rather than `gd` because `gd` is a common alias for `
 | Key                          | Action                                |
 |------------------------------|---------------------------------------|
 | `j` / `↓`, `k` / `↑`         | move cursor                           |
-| `enter` / `space`            | toggle expand/collapse                |
+| `enter` / `space`            | toggle expand/collapse (or open commit in log mode) |
 | `h` / `←`                    | collapse (or jump to parent)          |
 | `l` / `→`                    | expand                                |
+| `[` / `]`                    | previous / next folder                |
 | `g` / `G`                    | top / bottom                          |
-| `ctrl+d` / `ctrl+u`          | half-page down / up                   |
+| `ctrl+u` / `ctrl+d`          | page up / down                        |
+| `a`                          | cycle view: changed → all → log       |
+| `esc` / `backspace`          | back out of a commit into the log     |
 | `r`                          | refresh manually                      |
 | `?`                          | toggle help                           |
 | `q` / `ctrl+c`               | quit                                  |
 | left-click row               | toggle expand/collapse                |
 | scroll wheel                 | scroll viewport                       |
+
+### View modes
+
+Press <kbd>a</kbd> to cycle:
+
+1. **Changed** *(default)* — sparse tree of files with working-tree changes vs `HEAD`.
+2. **All** — every tracked file in the repo, with diff counts on changed ones.
+3. **Log** — the last 100 commits on the current branch. Select one with <kbd>enter</kbd> to open its file tree (commit vs parent; root and merge commits handled). <kbd>esc</kbd> / <kbd>backspace</kbd> returns to the log.
 
 ## What it shows
 
