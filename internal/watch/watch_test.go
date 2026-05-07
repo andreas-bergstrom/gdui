@@ -39,11 +39,11 @@ func TestShouldIgnore_VendorAndNodeModules(t *testing.T) {
 func TestShouldIgnore_EditorSwapFiles(t *testing.T) {
 	repo := "/repo"
 	cases := []string{
-		filepath.Join(repo, "src", ".#main.go"),       // emacs lock
-		filepath.Join(repo, "src", "main.go~"),         // backup
-		filepath.Join(repo, "src", ".main.go.swp"),     // vim primary swap
-		filepath.Join(repo, "src", ".main.go.swo"),     // vim secondary swap
-		filepath.Join(repo, "src", ".main.go.swx"),     // vim crash recovery
+		filepath.Join(repo, "src", ".#main.go"),    // emacs lock
+		filepath.Join(repo, "src", "main.go~"),     // backup
+		filepath.Join(repo, "src", ".main.go.swp"), // vim primary swap
+		filepath.Join(repo, "src", ".main.go.swo"), // vim secondary swap
+		filepath.Join(repo, "src", ".main.go.swx"), // vim crash recovery
 	}
 	for _, p := range cases {
 		if !shouldIgnore(repo, p) {

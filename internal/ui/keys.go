@@ -10,6 +10,7 @@ type keymap struct {
 	ToggleAll                         key.Binding
 	Back                              key.Binding
 	Blame                             key.Binding
+	Search                            key.Binding
 }
 
 var keys = keymap{
@@ -30,4 +31,5 @@ var keys = keymap{
 	ToggleAll: key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "changed/all/log")),
 	Back:      key.NewBinding(key.WithKeys("esc", "backspace"), key.WithHelp("esc", "back")),
 	Blame:     key.NewBinding(key.WithKeys("b"), key.WithHelp("b", "file history")),
+	Search:    key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "search")),
 }

@@ -179,4 +179,3 @@ func truncateANSI(s string, width int) string {
 	b.WriteString("\x1b[0m…")
 	return b.String()
 }
-

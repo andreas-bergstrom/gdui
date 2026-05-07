@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -31,6 +32,7 @@ const (
 	ModeLog
 	ModeCommit
 	ModeFileLog
+	ModeSearch
 )
 
 func (m viewMode) String() string {
@@ -43,6 +45,8 @@ func (m viewMode) String() string {
 		return "commit"
 	case ModeFileLog:
 		return "file log"
+	case ModeSearch:
+		return "search"
 	default:
 		return "changed"
 	}
@@ -80,6 +84,10 @@ type Model struct {
 	zones    *zone.Manager
 	showHelp bool
 	ready    bool
+
+	// search holds everything specific to ModeSearch (input, cached path
+	// index, current results, cursor, transient toast). See search.go.
+	search searchState
 }
 
 func New(repoRoot string) Model {
@@ -196,7 +204,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case RefreshMsg:
-		// File-watcher triggered refresh.
+		// File-watcher triggered refresh. The cached path index used by
+		// ModeSearch is potentially stale once files appear/disappear; mark
+		// it for reload regardless of the current mode.
+		m.search.pathsReady = false
+		m.search.paths = nil
 		switch m.mode {
 		case ModeChanged, ModeAll:
 			return m, loadStatusCmd(m.repoRoot, m.mode == ModeAll)
@@ -206,6 +218,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.fileLogPath != "" {
 				return m, loadFileLogCmd(m.repoRoot, m.fileLogPath)
 			}
+		case ModeSearch:
+			return m, loadSearchPathsCmd(m.repoRoot)
 		}
 		// ModeCommit: a single commit's contents are immutable; nothing to do.
 		return m, nil
@@ -317,6 +331,52 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case searchPathsMsg:
+		m.search.pathsReady = true
+		m.search.pathsErr = msg.err
+		if msg.err != nil {
+			m.refreshView()
+			return m, nil
+		}
+		m.search.paths = msg.paths
+		m.refreshView()
+		if m.mode == ModeSearch {
+			return m, m.kickSearch()
+		}
+		return m, nil
+
+	case searchResultMsg:
+		// Drop stale results — a newer query may already be in-flight.
+		if msg.seq != m.search.pendingQ {
+			return m, nil
+		}
+		m.search.result = msg.result
+		m.search.resultSeq = msg.seq
+		if m.search.cursor >= m.searchTotal() {
+			m.search.cursor = m.searchTotal() - 1
+			if m.search.cursor < 0 {
+				m.search.cursor = 0
+			}
+		}
+		m.refreshView()
+		return m, nil
+
+	case clipboardCopiedMsg:
+		if msg.err != nil && msg.seq == m.search.toastSeq {
+			m.search.toast = "copy failed: " + msg.err.Error()
+			m.search.toastUntil = time.Now().Add(toastDuration)
+			m.refreshView()
+		}
+		return m, nil
+
+	case clipboardToastExpiredMsg:
+		// Only clear the toast if no newer copy has happened since.
+		if msg.seq == m.search.toastSeq {
+			m.search.toast = ""
+			m.refreshView()
+		}
+		return m, nil
+
 	case tea.MouseMsg:
 		return m.handleMouse(msg)
 
@@ -327,6 +387,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Search mode owns its own input (printable runes go into the query),
+	// so dispatch to it before consulting the global bindings — the user
+	// must be able to type 'q', 'r', '/', 'a', etc. without triggering them.
+	if m.mode == ModeSearch {
+		// Allow ctrl+c to still quit and ? to still toggle help.
+		if msg.Type == tea.KeyCtrlC {
+			return m, tea.Quit
+		}
+		if msg.String() == "?" {
+			m.showHelp = !m.showHelp
+			return *m, nil
+		}
+		return m.handleKeySearch(msg)
+	}
+
 	switch {
 	case key.Matches(msg, keys.Quit):
 		return m, tea.Quit
@@ -335,6 +410,8 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case key.Matches(msg, keys.Refresh):
 		return *m, m.refreshCmd()
+	case key.Matches(msg, keys.Search):
+		return *m, m.enterSearch()
 	case key.Matches(msg, keys.ToggleAll):
 		return *m, m.cycleMode()
 	case key.Matches(msg, keys.Back):
@@ -483,6 +560,9 @@ func (m *Model) handleKeyLog(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if m.mode == ModeSearch {
+		return m.handleSearchMouse(msg)
+	}
 	switch msg.Button {
 	case tea.MouseButtonWheelUp:
 		m.vp.LineUp(3)
@@ -775,6 +855,10 @@ func (m *Model) refreshView() {
 		return
 	}
 	m.recomputeViewportHeight()
+	if m.mode == ModeSearch {
+		m.vp.SetContent(m.renderSearch())
+		return
+	}
 	if m.mode == ModeLog || m.mode == ModeFileLog {
 		if m.commitCursor >= len(m.commits) {
 			m.commitCursor = len(m.commits) - 1
@@ -903,6 +987,10 @@ func (m Model) header() string {
 		crumb := dimStyle.Render("log: " + m.fileLogPath)
 		return lipgloss.JoinHorizontal(lipgloss.Left, title, " ", crumb)
 	}
+	if m.mode == ModeSearch {
+		crumb := dimStyle.Render("search")
+		return lipgloss.JoinHorizontal(lipgloss.Left, title, " ", crumb)
+	}
 	repo := dimStyle.Render(m.repoRoot)
 	return lipgloss.JoinHorizontal(lipgloss.Left, title, " ", repo)
 }
@@ -910,6 +998,9 @@ func (m Model) header() string {
 func (m Model) footer() string {
 	if m.showHelp {
 		return helpStyle.Render("? close help · q quit")
+	}
+	if m.mode == ModeSearch {
+		return m.searchFooter()
 	}
 	if m.err != nil {
 		return errStyle.Render("error: " + m.err.Error())
@@ -1112,6 +1203,13 @@ func (m *Model) renderHelpBody() string {
 			{"b", "file history (commits touching this file)"},
 			{"left-click row", "toggle expand/collapse"},
 			{"scroll wheel", "scroll viewport"},
+		}},
+		{"Search", []row{
+			{"/", "open global search"},
+			{"*.go", "glob query — match filenames only"},
+			{"enter", "(in search) copy path or path:line"},
+			{"ctrl+u", "(in search) clear query"},
+			{"esc", "(in search) close"},
 		}},
 		{"Modes", []row{
 			{"a", "cycle view: changed → all → log"},
