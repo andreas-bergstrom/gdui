@@ -15,7 +15,13 @@ import (
 	"github.com/andreasbergstrom/gd/internal/tree"
 )
 
-const logLimit = 100
+const (
+	logLimit = 100
+	// scrollOff keeps a margin of context lines around the cursor when
+	// auto-scrolling, so the user can see what they're navigating toward
+	// instead of the cursor sitting flush against the screen edge.
+	scrollOff = 4
+)
 
 type viewMode int
 
@@ -44,9 +50,10 @@ type Model struct {
 	mode     viewMode
 
 	// tree state — used in Changed/All/Commit modes
-	root   *tree.Node
-	rows   []*tree.Node
-	cursor int
+	root       *tree.Node
+	rows       []*tree.Node
+	cursor     int
+	diffCursor int // line index inside the expanded file at `cursor`; -1 = on the file row itself
 
 	// log state — used in Log mode
 	commits      []git.Commit
@@ -69,10 +76,11 @@ type Model struct {
 
 func New(repoRoot string) Model {
 	return Model{
-		repoRoot: repoRoot,
-		mode:     ModeChanged,
-		root:     &tree.Node{IsDir: true, Expanded: true},
-		zones:    zone.New(),
+		repoRoot:   repoRoot,
+		mode:       ModeChanged,
+		root:       &tree.Node{IsDir: true, Expanded: true},
+		zones:      zone.New(),
+		diffCursor: -1,
 	}
 }
 
@@ -162,18 +170,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		headerH, footerH := 1, 1
-		vpH := msg.Height - headerH - footerH
-		if vpH < 1 {
-			vpH = 1
-		}
 		if !m.ready {
-			m.vp = viewport.New(msg.Width, vpH)
+			m.vp = viewport.New(msg.Width, 1)
 			m.ready = true
 		} else {
 			m.vp.Width = msg.Width
-			m.vp.Height = vpH
 		}
+		m.recomputeViewportHeight()
 		m.refreshView()
 		return m, nil
 
@@ -203,11 +206,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.preserveStateInto(msg.root)
 		m.root = msg.root
 		m.rows = tree.Flatten(m.root)
+		prevDiffCursor := m.diffCursor
 		m.cursor = 0
+		m.diffCursor = -1
 		if prevPath != "" {
 			for i, r := range m.rows {
 				if r.Path == prevPath {
 					m.cursor = i
+					m.diffCursor = prevDiffCursor // keep in-diff position on the same file
 					break
 				}
 			}
@@ -278,10 +284,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// rebuilt by a refresh while the hunk load was in flight, in which
 		// case the original *tree.Node pointer would be stale.
 		if n := tree.FindByPath(m.root, msg.path); n != nil && !n.IsDir {
+			// Capture the cursor's y BEFORE the hunk count changes so we can
+			// shift YOffset by the same delta — otherwise inserting N diff
+			// lines above the cursor pushes it visually off-screen.
+			prevY := m.cursorY()
 			n.Loading = false
 			n.LoadErr = msg.err
 			n.Hunks = msg.hunks
 			m.refreshView()
+			if delta := m.cursorY() - prevY; delta != 0 {
+				m.vp.SetYOffset(m.vp.YOffset + delta)
+			}
 		}
 		return m, nil
 
@@ -321,23 +334,29 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *Model) handleKeyTree(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
 	case key.Matches(msg, keys.Down):
-		m.moveCursor(1)
+		m.moveDown()
 	case key.Matches(msg, keys.Up):
-		m.moveCursor(-1)
+		m.moveUp()
 	case key.Matches(msg, keys.PgDn):
+		m.diffCursor = -1
 		m.moveCursor(m.vp.Height / 2)
 	case key.Matches(msg, keys.PgUp):
+		m.diffCursor = -1
 		m.moveCursor(-m.vp.Height / 2)
 	case key.Matches(msg, keys.NextDir):
+		m.diffCursor = -1
 		m.jumpDir(1)
 	case key.Matches(msg, keys.PrevDir):
+		m.diffCursor = -1
 		m.jumpDir(-1)
 	case key.Matches(msg, keys.Top):
 		m.cursor = 0
-		m.refreshView()
+		m.diffCursor = -1
+		m.refreshViewToCursor()
 	case key.Matches(msg, keys.Bottom):
 		m.cursor = len(m.rows) - 1
-		m.refreshView()
+		m.diffCursor = -1
+		m.refreshViewToCursor()
 	case key.Matches(msg, keys.Toggle):
 		return *m, m.toggle(m.currentNode())
 	case key.Matches(msg, keys.Right):
@@ -350,6 +369,7 @@ func (m *Model) handleKeyTree(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if n == nil {
 			return *m, nil
 		}
+		// In-diff cursor or expanded file → collapse.
 		if n.Expanded {
 			return *m, m.toggle(n)
 		}
@@ -360,10 +380,56 @@ func (m *Model) handleKeyTree(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					break
 				}
 			}
-			m.refreshView()
+			m.diffCursor = -1
+			m.refreshViewToCursor()
 		}
 	}
 	return *m, nil
+}
+
+// moveDown advances one step. If the cursor is on an expanded file with
+// rendered diff content, it walks through the diff lines first; once past the
+// last diff line, it moves to the next tree row.
+func (m *Model) moveDown() {
+	n := m.currentNode()
+	if n != nil && !n.IsDir && n.Expanded {
+		if max := diffNavCount(n); max > 0 {
+			if m.diffCursor < max-1 {
+				m.diffCursor++
+				m.refreshViewToCursor()
+				return
+			}
+		}
+	}
+	m.diffCursor = -1
+	m.moveCursor(1)
+}
+
+// moveUp is the inverse of moveDown.
+func (m *Model) moveUp() {
+	if m.diffCursor > 0 {
+		m.diffCursor--
+		m.refreshViewToCursor()
+		return
+	}
+	if m.diffCursor == 0 {
+		m.diffCursor = -1
+		m.refreshViewToCursor()
+		return
+	}
+	m.moveCursor(-1)
+}
+
+// diffNavCount is the number of diff lines navigable inside an expanded file.
+// Returns 0 when there's nothing to navigate (loading, binary, error, no diff).
+func diffNavCount(n *tree.Node) int {
+	if n == nil || n.IsDir || n.File == nil {
+		return 0
+	}
+	if n.File.Binary || n.Loading || n.LoadErr != nil {
+		return 0
+	}
+	return render.HunkLineCount(n.Hunks)
 }
 
 func (m *Model) handleKeyLog(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -378,10 +444,10 @@ func (m *Model) handleKeyLog(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.moveCommitCursor(-m.vp.Height / 2)
 	case key.Matches(msg, keys.Top):
 		m.commitCursor = 0
-		m.refreshView()
+		m.refreshViewToCursor()
 	case key.Matches(msg, keys.Bottom):
 		m.commitCursor = len(m.commits) - 1
-		m.refreshView()
+		m.refreshViewToCursor()
 	case key.Matches(msg, keys.Toggle), key.Matches(msg, keys.Right):
 		return *m, m.openCommit()
 	}
@@ -415,6 +481,7 @@ func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 		if z := m.zones.Get(zoneID(i)); z.InBounds(msg) {
 			m.cursor = i
+			m.diffCursor = -1
 			return *m, m.toggle(n)
 		}
 	}
@@ -429,6 +496,7 @@ func (m *Model) resetTree() {
 	m.root = &tree.Node{IsDir: true, Expanded: true}
 	m.rows = nil
 	m.cursor = 0
+	m.diffCursor = -1
 }
 
 func (m *Model) clearSelectedCommit() {
@@ -511,9 +579,10 @@ func (m *Model) toggle(n *tree.Node) tea.Cmd {
 	if n == nil {
 		return nil
 	}
+	m.diffCursor = -1
 	if n.IsDir {
 		n.Expanded = !n.Expanded
-		m.refreshView()
+		m.refreshViewToCursor()
 		return nil
 	}
 	if n.File == nil {
@@ -523,16 +592,16 @@ func (m *Model) toggle(n *tree.Node) tea.Cmd {
 		n.Expanded = false
 		n.Hunks = nil
 		n.LoadErr = nil
-		m.refreshView()
+		m.refreshViewToCursor()
 		return nil
 	}
 	n.Expanded = true
 	if n.File.Binary {
-		m.refreshView()
+		m.refreshViewToCursor()
 		return nil
 	}
 	n.Loading = true
-	m.refreshView()
+	m.refreshViewToCursor()
 	return loadHunksCmd(m.repoRoot, n.Path, *n.File, m.selectedSHA)
 }
 
@@ -544,7 +613,7 @@ func (m *Model) jumpDir(dir int) {
 	for i >= 0 && i < len(m.rows) {
 		if m.rows[i].IsDir {
 			m.cursor = i
-			m.refreshView()
+			m.refreshViewToCursor()
 			return
 		}
 		i += dir
@@ -562,7 +631,7 @@ func (m *Model) moveCursor(d int) {
 	if m.cursor >= len(m.rows) {
 		m.cursor = len(m.rows) - 1
 	}
-	m.refreshView()
+	m.refreshViewToCursor()
 }
 
 func (m *Model) moveCommitCursor(d int) {
@@ -576,7 +645,7 @@ func (m *Model) moveCommitCursor(d int) {
 	if m.commitCursor >= len(m.commits) {
 		m.commitCursor = len(m.commits) - 1
 	}
-	m.refreshView()
+	m.refreshViewToCursor()
 }
 
 func (m *Model) preserveStateInto(newRoot *tree.Node) {
@@ -614,10 +683,34 @@ func (m *Model) preserveStateInto(newRoot *tree.Node) {
 	apply(newRoot)
 }
 
+// recomputeViewportHeight resizes the viewport based on the actual rendered
+// height of the header and footer. In a narrow sidebar the footer string can
+// soft-wrap to 2+ lines; if the viewport keeps assuming 1, the body overflows
+// the terminal and the bottom rows (where the cursor sits) get clipped — making
+// the cursor look like it's drifted off-screen even though the math says it's
+// visible.
+func (m *Model) recomputeViewportHeight() {
+	if !m.ready {
+		return
+	}
+	headerH := lipgloss.Height(m.header())
+	footerH := lipgloss.Height(m.footer())
+	vpH := m.height - headerH - footerH
+	if vpH < 1 {
+		vpH = 1
+	}
+	m.vp.Height = vpH
+}
+
+// refreshView re-renders the viewport content without touching the scroll
+// position. Use this for content changes (status reload, hunk arrival) so that
+// a watcher-triggered refresh doesn't yank the viewport back to the cursor row
+// while the user is reading further down inside an expanded diff.
 func (m *Model) refreshView() {
 	if !m.ready {
 		return
 	}
+	m.recomputeViewportHeight()
 	if m.mode == ModeLog {
 		if m.commitCursor >= len(m.commits) {
 			m.commitCursor = len(m.commits) - 1
@@ -626,7 +719,6 @@ func (m *Model) refreshView() {
 			m.commitCursor = 0
 		}
 		m.vp.SetContent(m.renderLog())
-		m.ensureCommitCursorVisible()
 		return
 	}
 	m.rows = tree.Flatten(m.root)
@@ -636,11 +728,38 @@ func (m *Model) refreshView() {
 	if m.cursor < 0 {
 		m.cursor = 0
 	}
+	if m.diffCursor >= 0 {
+		if max := diffNavCount(m.currentNode()); max == 0 {
+			m.diffCursor = -1
+		} else if m.diffCursor >= max {
+			m.diffCursor = max - 1
+		}
+	}
 	m.vp.SetContent(m.renderBody())
+}
+
+// refreshViewToCursor rebuilds and then scrolls the cursor into view. Use this
+// from explicit cursor-moving handlers (key navigation, click, expand/collapse).
+func (m *Model) refreshViewToCursor() {
+	m.refreshView()
+	if !m.ready {
+		return
+	}
+	if m.mode == ModeLog {
+		m.ensureCommitCursorVisible()
+		return
+	}
 	m.ensureCursorVisible()
 }
 
 func (m *Model) ensureCursorVisible() {
+	m.scrollTo(m.cursorY())
+}
+
+// cursorY returns the line index (within the rendered body) of the cursor —
+// either the cursor's tree row or, when stepping inside an expanded file, the
+// highlighted diff line.
+func (m *Model) cursorY() int {
 	y := 0
 	for i, n := range m.rows {
 		if i == m.cursor {
@@ -651,19 +770,28 @@ func (m *Model) ensureCursorVisible() {
 			y += hunkLineCount(n)
 		}
 	}
-	if y < m.vp.YOffset {
-		m.vp.SetYOffset(y)
-	} else if y >= m.vp.YOffset+m.vp.Height {
-		m.vp.SetYOffset(y - m.vp.Height + 1)
+	if m.diffCursor >= 0 {
+		y += 1 + m.diffCursor
 	}
+	return y
 }
 
 func (m *Model) ensureCommitCursorVisible() {
-	y := m.commitCursor
-	if y < m.vp.YOffset {
-		m.vp.SetYOffset(y)
-	} else if y >= m.vp.YOffset+m.vp.Height {
-		m.vp.SetYOffset(y - m.vp.Height + 1)
+	m.scrollTo(m.commitCursor)
+}
+
+// scrollTo adjusts the viewport so line `y` (0-indexed within the rendered
+// content) is visible with a scrollOff-line margin from each edge. The margin
+// shrinks gracefully on tiny viewports.
+func (m *Model) scrollTo(y int) {
+	margin := scrollOff
+	if m.vp.Height <= 2*scrollOff+1 {
+		margin = m.vp.Height / 2
+	}
+	if y < m.vp.YOffset+margin {
+		m.vp.SetYOffset(y - margin)
+	} else if y >= m.vp.YOffset+m.vp.Height-margin {
+		m.vp.SetYOffset(y - m.vp.Height + 1 + margin)
 	}
 }
 
@@ -699,8 +827,8 @@ func (m Model) View() string {
 	if !m.ready {
 		return ""
 	}
-	header := m.header()
-	footer := m.footer()
+	header := m.fitWidth(m.header())
+	footer := m.fitWidth(m.footer())
 	body := m.vp.View()
 	return m.zones.Scan(lipgloss.JoinVertical(lipgloss.Left, header, body, footer))
 }
@@ -763,11 +891,11 @@ func (m *Model) renderBody() string {
 	}
 	var b strings.Builder
 	for i, n := range m.rows {
-		row := m.renderRow(i, n)
+		row := m.fitWidth(m.renderRow(i, n))
 		b.WriteString(m.zones.Mark(zoneID(i), row))
 		b.WriteByte('\n')
 		if !n.IsDir && n.Expanded {
-			b.WriteString(m.renderExpanded(n))
+			b.WriteString(m.fitLines(m.renderExpanded(n)))
 			b.WriteByte('\n')
 		}
 	}
@@ -786,11 +914,35 @@ func (m *Model) renderLog() string {
 	}
 	var b strings.Builder
 	for i, c := range m.commits {
-		row := m.renderCommitRow(i, c)
+		row := m.fitWidth(m.renderCommitRow(i, c))
 		b.WriteString(m.zones.Mark(commitZoneID(i), row))
 		b.WriteByte('\n')
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// fitWidth truncates a single line to the viewport width if it would otherwise
+// soft-wrap inside the viewport (lipgloss wraps lines wider than its style
+// Width, which silently inflates rendered line count and breaks cursor-y math).
+func (m *Model) fitWidth(line string) string {
+	if m.width <= 0 || lipgloss.Width(line) <= m.width {
+		return line
+	}
+	return render.TruncateANSI(line, m.width)
+}
+
+// fitLines applies fitWidth to every line in a multi-line block.
+func (m *Model) fitLines(block string) string {
+	if m.width <= 0 {
+		return block
+	}
+	lines := strings.Split(block, "\n")
+	for i, ln := range lines {
+		if lipgloss.Width(ln) > m.width {
+			lines[i] = render.TruncateANSI(ln, m.width)
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m *Model) renderCommitRow(i int, c git.Commit) string {
@@ -865,7 +1017,11 @@ func (m *Model) renderExpanded(n *tree.Node) string {
 	if len(n.Hunks) == 0 {
 		return dimStyle.Render("  ⟨no diff⟩")
 	}
-	return render.Hunks(n.Path, n.Hunks, m.width)
+	cursor := -1
+	if i := m.cursor; i >= 0 && i < len(m.rows) && m.rows[i] == n {
+		cursor = m.diffCursor
+	}
+	return render.Hunks(n.Path, n.Hunks, m.width, cursor)
 }
 
 func zoneID(i int) string       { return fmt.Sprintf("row-%d", i) }

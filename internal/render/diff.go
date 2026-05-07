@@ -16,19 +16,21 @@ import (
 const LargeDiffThreshold = 2000
 
 var (
-	addMark   = lipgloss.NewStyle().Foreground(lipgloss.Color("#9ece6a")).Bold(true)
-	delMark   = lipgloss.NewStyle().Foreground(lipgloss.Color("#f7768e")).Bold(true)
-	ctxMark   = lipgloss.NewStyle().Foreground(lipgloss.Color("#565f89"))
-	hunkHdr   = lipgloss.NewStyle().Foreground(lipgloss.Color("#7aa2f7")).Faint(true)
-	noNewline = lipgloss.NewStyle().Foreground(lipgloss.Color("#888")).Faint(true)
-	chromaSty = styles.Get("github-dark")
-	formatter = formatters.Get("terminal16m")
+	addMark    = lipgloss.NewStyle().Foreground(lipgloss.Color("#9ece6a")).Bold(true)
+	delMark    = lipgloss.NewStyle().Foreground(lipgloss.Color("#f7768e")).Bold(true)
+	ctxMark    = lipgloss.NewStyle().Foreground(lipgloss.Color("#565f89"))
+	hunkHdr    = lipgloss.NewStyle().Foreground(lipgloss.Color("#7aa2f7")).Faint(true)
+	noNewline  = lipgloss.NewStyle().Foreground(lipgloss.Color("#888")).Faint(true)
+	cursorLine = lipgloss.NewStyle().Background(lipgloss.Color("#3b4261"))
+	chromaSty  = styles.Get("github-dark")
+	formatter  = formatters.Get("terminal16m")
 )
 
 // Hunks renders a slice of hunks for a given path into a multi-line string.
 // Width is used for truncation/padding of background-tinted lines so the bg
-// extends to the right edge.
-func Hunks(path string, hunks []git.Hunk, width int) string {
+// extends to the right edge. cursor is the index of the line to highlight
+// (matches HunkLineCount ordering); pass -1 for no highlight.
+func Hunks(path string, hunks []git.Hunk, width int, cursor int) string {
 	if width < 10 {
 		width = 10
 	}
@@ -49,20 +51,54 @@ func Hunks(path string, hunks []git.Hunk, width int) string {
 	lex = chroma.Coalesce(lex)
 
 	var b strings.Builder
-	for _, h := range hunks {
-		b.WriteString(hunkHdr.Render(h.Header))
+	idx := 0
+	emit := func(line string) {
+		if idx == cursor {
+			pad := width - lipgloss.Width(line)
+			if pad > 0 {
+				line += strings.Repeat(" ", pad)
+			}
+			line = cursorLine.Render(line)
+		}
+		b.WriteString(line)
 		b.WriteByte('\n')
+		idx++
+	}
+	for _, h := range hunks {
+		emit(hunkHdr.Render(h.Header))
 		for _, ln := range h.Lines {
-			b.WriteString(renderLine(lex, ln, width))
-			b.WriteByte('\n')
+			emit(renderLine(lex, ln, width))
 			if ln.NoNewlineHere {
-				b.WriteString(noNewline.Render(`  \ No newline at end of file`))
-				b.WriteByte('\n')
+				emit(noNewline.Render(`  \ No newline at end of file`))
 			}
 		}
 	}
 	return strings.TrimRight(b.String(), "\n")
 }
+
+// HunkLineCount returns the number of rendered lines for a slice of hunks
+// (hunk headers + content lines + no-newline markers). Used for both layout
+// and in-diff cursor bounds.
+func HunkLineCount(hunks []git.Hunk) int {
+	c := 0
+	for _, h := range hunks {
+		c++
+		c += len(h.Lines)
+		for _, l := range h.Lines {
+			if l.NoNewlineHere {
+				c++
+			}
+		}
+	}
+	return c
+}
+
+// tabWidth controls how tabs in diff source are expanded before rendering.
+// Terminals render \t as a variable number of cells, but lipgloss.Width counts
+// it as 0 — so any tab in the text would silently wrap the line in the
+// terminal even after we "truncate" it to viewport width. Expanding to a
+// fixed-width run of spaces makes visual width == counted width.
+const tabWidth = 4
 
 func renderLine(lex chroma.Lexer, ln git.DiffLine, width int) string {
 	var marker string
@@ -74,7 +110,8 @@ func renderLine(lex chroma.Lexer, ln git.DiffLine, width int) string {
 	default:
 		marker = ctxMark.Render(" ")
 	}
-	highlighted := highlight(lex, ln.Text)
+	text := strings.ReplaceAll(ln.Text, "\t", strings.Repeat(" ", tabWidth))
+	highlighted := highlight(lex, text)
 	content := marker + highlighted
 	visible := lipgloss.Width(content)
 	if visible > width {
@@ -100,6 +137,13 @@ func highlight(lex chroma.Lexer, text string) string {
 	out = strings.TrimRight(out, "\n")
 	return out
 }
+
+// TruncateANSI truncates a string containing ANSI SGR escapes to `width`
+// visible cells, preserving escape sequences and appending an ellipsis. Use
+// this on any line about to be sent to a viewport: lipgloss soft-wraps lines
+// wider than the viewport, which silently inflates the rendered line count
+// and breaks cursor-position math.
+func TruncateANSI(s string, width int) string { return truncateANSI(s, width) }
 
 // truncateANSI truncates a string containing ANSI SGR escapes to `width`
 // visible cells, preserving escape sequences and appending an ellipsis.
