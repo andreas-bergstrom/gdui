@@ -53,6 +53,7 @@ brews:
   - name: gdui
     ids:
       - default
+    directory: Formula
     repository:
       owner: andreas-bergstrom
       name: homebrew-tap
