@@ -178,10 +178,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case RefreshMsg:
-		// File-watcher triggered refresh: only meaningful for working-tree views.
-		if m.mode == ModeChanged || m.mode == ModeAll {
+		// File-watcher triggered refresh.
+		switch m.mode {
+		case ModeChanged, ModeAll:
 			return m, loadStatusCmd(m.repoRoot, m.mode == ModeAll)
+		case ModeLog:
+			return m, loadLogCmd(m.repoRoot)
 		}
+		// ModeCommit: a single commit's contents are immutable; nothing to do.
 		return m, nil
 
 	case statusMsg:
@@ -234,10 +238,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.err = nil
+		// Preserve the cursor's SHA across reloads so a watcher-triggered
+		// refresh (new commit) doesn't yank the cursor off the user's row.
+		var prevSHA string
+		if m.commitCursor >= 0 && m.commitCursor < len(m.commits) {
+			prevSHA = m.commits[m.commitCursor].SHA
+		}
 		m.commits = msg.commits
 		m.logLoaded = true
-		if m.commitCursor >= len(m.commits) {
-			m.commitCursor = 0
+		m.commitCursor = 0
+		if prevSHA != "" {
+			for i, c := range m.commits {
+				if c.SHA == prevSHA {
+					m.commitCursor = i
+					break
+				}
+			}
 		}
 		m.refreshView()
 		return m, nil

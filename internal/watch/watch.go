@@ -21,6 +21,10 @@ func Start(repoRoot string, debounce time.Duration, onChange func()) (stop func(
 	}
 
 	addRecursive(w, repoRoot)
+	// Also watch .git/logs (non-recursive) so we catch HEAD updates from
+	// commits, checkouts, resets, etc. fsnotify watches at directory
+	// granularity; shouldIgnore allows the specific HEAD file through.
+	_ = w.Add(filepath.Join(repoRoot, ".git", "logs"))
 
 	done := make(chan struct{})
 	go run(w, repoRoot, debounce, onChange, done)
@@ -107,7 +111,15 @@ func shouldIgnore(repoRoot, path string) bool {
 	}
 	first := strings.SplitN(rel, string(filepath.Separator), 2)[0]
 	switch first {
-	case ".git", "node_modules", "vendor":
+	case ".git":
+		// Allow .git/logs/HEAD through — it's touched by every HEAD-affecting
+		// operation (commit, checkout, reset, merge), giving us a reliable
+		// signal to refresh the log view.
+		if rel == filepath.Join(".git", "logs", "HEAD") {
+			return false
+		}
+		return true
+	case "node_modules", "vendor":
 		return true
 	}
 	// Editor swap/lock noise.
