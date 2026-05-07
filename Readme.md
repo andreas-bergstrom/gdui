@@ -35,13 +35,31 @@ macOS binaries are signed with my Developer ID and notarized — no Gatekeeper w
 
 ### Pre-built binaries
 
-Grab the archive for your platform from the [latest release](https://github.com/andreas-bergstrom/gdui/releases/latest):
+The [latest release](https://github.com/andreas-bergstrom/gdui/releases/latest) ships archives + `checksums.txt` for:
 
-- `gdui_<version>_darwin_amd64.tar.gz` / `gdui_<version>_darwin_arm64.tar.gz`
-- `gdui_<version>_linux_amd64.tar.gz` / `gdui_<version>_linux_arm64.tar.gz`
-- `gdui_<version>_windows_amd64.zip`
+- **macOS** arm64 / amd64 (`.tar.gz`) — signed with my Developer ID and notarized
+- **Linux** arm64 / amd64 (`.tar.gz`)
+- **Windows** amd64 (`.zip`)
 
-Extract and put the `gdui` binary somewhere on your `PATH`. `checksums.txt` is published alongside for verification.
+**macOS / Linux:**
+
+```sh
+VERSION=0.1.0          # bump to whatever the releases page shows
+OS=darwin              # or linux
+ARCH=arm64             # or amd64
+
+curl -LO "https://github.com/andreas-bergstrom/gdui/releases/download/v${VERSION}/gdui_${VERSION}_${OS}_${ARCH}.tar.gz"
+tar -xzf "gdui_${VERSION}_${OS}_${ARCH}.tar.gz"
+sudo install -m 0755 gdui /usr/local/bin/gdui
+```
+
+**Windows:** download `gdui_<version>_windows_amd64.zip` from the [releases page](https://github.com/andreas-bergstrom/gdui/releases/latest), extract `gdui.exe`, and place it on your `PATH` (e.g. `%LOCALAPPDATA%\Microsoft\WindowsApps\`).
+
+Verify integrity (macOS / Linux):
+
+```sh
+shasum -a 256 -c checksums.txt
+```
 
 ### From source
 
@@ -118,4 +136,4 @@ go build -o gdui .
 
 The UI smoke test (`internal/ui/smoke_test.go`) auto-skips if `/tmp/gd-smoke` (or `$GD_SMOKE_REPO`) is not a git repo. To exercise it, populate that directory with a dirty repo first.
 
-See `CLAUDE.md` for the architecture overview.
+See `CLAUDE.md` for the architecture overview and release pipeline.
