@@ -1,5 +1,6 @@
 # Build output
 /gdui
+/dist/
 *.exe
 
 # Go test / coverage / profiling artifacts

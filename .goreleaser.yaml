@@ -1,0 +1,93 @@
+version: 2
+
+project_name: gdui
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: gdui
+    binary: gdui
+    main: .
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.ShortCommit}}
+      - -X main.date={{.Date}}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    hooks:
+      post:
+        - cmd: ./scripts/sign-darwin.sh "{{ .Path }}" "{{ .Target }}" "{{ .IsSnapshot }}"
+
+archives:
+  - id: default
+    ids:
+      - gdui
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: "{{.ProjectName}}_{{.Version}}_{{.Os}}_{{.Arch}}"
+    files:
+      - LICENSE
+      - Readme.md
+
+checksum:
+  name_template: checksums.txt
+
+brews:
+  - name: gdui
+    ids:
+      - default
+    repository:
+      owner: andreas-bergstrom
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: https://github.com/andreas-bergstrom/gdui
+    description: Terminal UI for browsing your working-tree git diff as a sparse, collapsible file tree
+    license: MIT
+    install: |
+      bin.install "gdui"
+    test: |
+      assert_match "gdui", shell_output("#{bin}/gdui --version")
+
+changelog:
+  sort: asc
+  use: github
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
+      order: 0
+    - title: Fixes
+      regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
+      order: 1
+    - title: Other
+      order: 999
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - '^ci:'
+      - 'Merge pull request'
+
+release:
+  draft: false
+  prerelease: auto
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
