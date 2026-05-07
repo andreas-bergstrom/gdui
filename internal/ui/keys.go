@@ -8,6 +8,7 @@ type keymap struct {
 	Left, Right, Toggle               key.Binding
 	Refresh, Help, Quit               key.Binding
 	ToggleAll                         key.Binding
+	Back                              key.Binding
 }
 
 var keys = keymap{
@@ -25,5 +26,6 @@ var keys = keymap{
 	Refresh: key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
 	Help:    key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
 	Quit:      key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
-	ToggleAll: key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "all/changed")),
+	ToggleAll: key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "changed/all/log")),
+	Back:      key.NewBinding(key.WithKeys("esc", "backspace"), key.WithHelp("esc", "back")),
 }

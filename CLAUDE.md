@@ -25,6 +25,7 @@ Layered, all code under `internal/`:
 - **`internal/git`** — shells out to `git` and parses output.
   - `status.go`: `git status --porcelain=v2 -z` + `git diff --numstat HEAD` → `[]ChangedFile` with adds/dels/binary flag. Untracked-file line counts are filled by reading the file directly.
   - `diff.go`: `LoadHunks` returns `[]Hunk` for one file (tracked uses `git diff HEAD --`; untracked synthesizes all-`+`; deleted uses `git show HEAD:`). `ParseUnified` is a hand-rolled unified-diff parser; edge cases (no-newline-at-eof, binary, multi-hunk, CRLF, rename, deleted) are covered by `diff_test.go`.
+  - `commits.go`: `Log(repoRoot, limit)` runs `git log --pretty=format:%H%x1f%h%x1f%an%x1f%ad%x1f%s` (US-delimited, date `%ad` = `--date=short`). `CommitFiles(sha)` combines `git show --numstat -z` with `--name-status -z` (overlay accurate kinds — A/D/R) for one commit vs its parent. `CommitHunks(sha, path)` reuses `ParseUnified` on `git show <sha> -- <path>`.
 
 - **`internal/tree`** — pure data layer. `Build([]ChangedFile) *Node` produces a sparse tree (only changed paths exist), sorts dirs-first, path-collapses single-child directory chains (`src/foo/bar/`), aggregates +/- counts bottom-up, and default-expands directories. `Flatten(root)` turns current expand state into a display-order row list.
 
@@ -33,8 +34,8 @@ Layered, all code under `internal/`:
 - **`internal/watch`** — fsnotify-backed recursive directory watcher. Ignores `.git`, `node_modules`, `vendor`, and editor swap files; debounces bursts with a quiet-period timer (default 200ms in `main.go`); auto-adds newly created subdirectories. Calls back into `main`, which sends `ui.RefreshMsg{}` to the running tea program.
 
 - **`internal/ui`** — the Bubble Tea program.
-  - `model.go`: `Model` holds `*tree.Node` root, flattened `rows`, cursor index, `viewport.Model`, and a `*zone.Manager` from `bubblezone` for mouse hit-testing.
-  - `Update` dispatches on `WindowSizeMsg`, `statusMsg` (initial + refresh), `hunksMsg` (lazy hunk load), `tea.KeyMsg`, `tea.MouseMsg`. Hunks load asynchronously via `tea.Cmd`; the goroutine returns a `hunksMsg`.
+  - `model.go`: `Model` holds `*tree.Node` root, flattened `rows`, cursor index, `viewport.Model`, and a `*zone.Manager` from `bubblezone` for mouse hit-testing. Has a `mode` enum (`ModeChanged` → `ModeAll` → `ModeLog` → cycles via `a`); selecting a commit from `ModeLog` enters `ModeCommit` (a tree of that commit's files). `esc`/`backspace` returns from `ModeCommit` to `ModeLog`. The same tree rendering is reused for `ModeChanged`/`ModeAll`/`ModeCommit`; `ModeLog` uses a separate flat commit-row renderer with `commit-N` zone IDs. `loadHunksCmd` takes a `sha` arg — empty means worktree (uses `git.LoadHunks`), non-empty routes to `git.CommitHunks`.
+  - `Update` dispatches on `WindowSizeMsg`, `statusMsg`, `logMsg`, `commitTreeMsg`, `hunksMsg`, `tea.KeyMsg`, `tea.MouseMsg`. Hunks load asynchronously via `tea.Cmd`; the goroutine returns a `hunksMsg`. `RefreshMsg` from the file watcher is ignored in `ModeLog`/`ModeCommit` — those views aren't tied to working-tree state.
   - `View` rebuilds the row list and re-marks zones on **every** call (don't cache — when a file expands and inserts N hunk lines, downstream zone Y-coords shift and stale zones mis-route clicks). Then wraps the viewport's output in `m.zones.Scan(...)`.
   - On collapse, `Hunks` are dropped from the node — re-fetched on the next expand. Git diff is cheap; this avoids stale-data bugs after `r` (refresh).
   - `r` triggers a full status reload; expand state is preserved across reloads by path in `preserveStateInto`.
