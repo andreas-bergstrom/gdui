@@ -36,10 +36,12 @@ func runDiff(repoRoot, path string) ([]Hunk, error) {
 	out, err := cmd.Output()
 	if err != nil {
 		// Repo with no HEAD yet → fall back to comparing against empty tree.
-		out2, err2 := exec.Command("git", "-C", repoRoot, "-c", "core.quotepath=false",
+		// `git diff --no-index` exits non-zero when files differ; that's
+		// expected, so we surface its output regardless.
+		out2, _ := exec.Command("git", "-C", repoRoot, "-c", "core.quotepath=false",
 			"diff", "--no-color", "--no-index", "/dev/null", filepath.Join(repoRoot, path)).Output()
-		if err2 != nil {
-			return nil, err
+		if len(out2) == 0 {
+			return nil, fmt.Errorf("git diff HEAD -- %s: %w", path, err)
 		}
 		out = out2
 	}
@@ -55,7 +57,7 @@ func synthesizeUntracked(repoRoot, path string) ([]Hunk, error) {
 	defer fp.Close()
 	var lines []DiffLine
 	sc := bufio.NewScanner(fp)
-	sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	sc.Buffer(make([]byte, 64*1024), maxScannerLine)
 	for sc.Scan() {
 		lines = append(lines, DiffLine{Kind: '+', Text: sc.Text()})
 	}
@@ -73,12 +75,14 @@ func synthesizeDeleted(repoRoot, path string) ([]Hunk, error) {
 	if err != nil {
 		return nil, err
 	}
-	var lines []DiffLine
-	for _, t := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
-		lines = append(lines, DiffLine{Kind: '-', Text: t})
-	}
-	if len(lines) == 0 {
+	content := strings.TrimRight(string(out), "\n")
+	if content == "" {
 		return nil, nil
+	}
+	parts := strings.Split(content, "\n")
+	lines := make([]DiffLine, len(parts))
+	for i, t := range parts {
+		lines[i] = DiffLine{Kind: '-', Text: t}
 	}
 	return []Hunk{{
 		Header: fmt.Sprintf("@@ -1,%d +0,0 @@", len(lines)),

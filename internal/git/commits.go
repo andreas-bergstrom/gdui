@@ -1,6 +1,7 @@
 package git
 
 import (
+	"fmt"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -25,7 +26,7 @@ func Log(repoRoot string, limit int) ([]Commit, error) {
 	)
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("git log: %w", err)
 	}
 	return parseLog(out), nil
 }
@@ -43,7 +44,7 @@ func LogForPath(repoRoot, path string, limit int) ([]Commit, error) {
 	)
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("git log %s: %w", path, err)
 	}
 	return parseLog(out), nil
 }
@@ -89,7 +90,7 @@ func CommitFiles(repoRoot, sha string) ([]ChangedFile, error) {
 		"--raw", "--numstat", "-z", "-M", sha)
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("git diff-tree %s: %w", sha, err)
 	}
 	records := splitNUL(out)
 
@@ -106,12 +107,13 @@ func CommitFiles(repoRoot, sha string) ([]ChangedFile, error) {
 		if rec[0] != ':' {
 			break // start of numstat section
 		}
-		// `:mode mode sha sha STATUS\0path[\0newpath]`
-		tab := strings.LastIndexByte(rec, ' ')
-		if tab < 0 {
+		// `:mode mode sha sha STATUS\0path[\0newpath]` — STATUS sits after the
+		// last space; the path on the next NUL record.
+		sp := strings.LastIndexByte(rec, ' ')
+		if sp < 0 {
 			continue
 		}
-		status := rec[tab+1:]
+		status := rec[sp+1:]
 		if status == "" || i+1 >= len(records) {
 			continue
 		}
@@ -190,7 +192,7 @@ func CommitHunks(repoRoot, sha, path string) ([]Hunk, error) {
 		sha, "--", path)
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("git diff-tree %s -- %s: %w", sha, path, err)
 	}
 	return ParseUnified(out), nil
 }

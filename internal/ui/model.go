@@ -859,28 +859,19 @@ func (m *Model) scrollTo(y int) {
 	}
 }
 
+// hunkLineCount returns the number of body lines an expanded file row will
+// occupy. For "real" diff content this is render.HunkLineCount; for placeholder
+// rows (binary, loading, error, empty) we always render one line.
 func hunkLineCount(n *tree.Node) int {
 	if n.File != nil && n.File.Binary {
 		return 1
 	}
-	if n.Loading {
+	if n.Loading || n.LoadErr != nil {
 		return 1
 	}
-	if n.LoadErr != nil {
-		return 1
-	}
-	c := 0
-	for _, h := range n.Hunks {
-		c++
-		c += len(h.Lines)
-		for _, l := range h.Lines {
-			if l.NoNewlineHere {
-				c++
-			}
-		}
-	}
+	c := render.HunkLineCount(n.Hunks)
 	if c == 0 {
-		c = 1
+		return 1 // ⟨no diff⟩ placeholder
 	}
 	return c
 }

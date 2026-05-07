@@ -10,6 +10,11 @@ import (
 	"strings"
 )
 
+// maxScannerLine bounds bufio.Scanner buffers used to count lines in arbitrary
+// files. Files with single lines longer than this will yield a truncated count
+// rather than failing the whole status load.
+const maxScannerLine = 4 * 1024 * 1024
+
 // Status returns the list of changed files in the working tree relative to HEAD,
 // merging staged + unstaged + untracked, with line counts.
 func Status(repoRoot string) ([]ChangedFile, error) {
@@ -199,7 +204,7 @@ func fillUntracked(repoRoot string, files []ChangedFile) error {
 			continue
 		}
 		sc := bufio.NewScanner(fp)
-		sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
+		sc.Buffer(make([]byte, 64*1024), maxScannerLine)
 		n := 0
 		for sc.Scan() {
 			n++

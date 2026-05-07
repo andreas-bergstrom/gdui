@@ -43,6 +43,9 @@ func run(w *fsnotify.Watcher, repoRoot string, debounce time.Duration, onChange 
 	for {
 		select {
 		case <-done:
+			if timer != nil {
+				timer.Stop()
+			}
 			return
 		case ev, ok := <-w.Events:
 			if !ok {
@@ -128,6 +131,7 @@ func shouldIgnore(repoRoot, path string) bool {
 	case strings.HasPrefix(base, ".#"),
 		strings.HasSuffix(base, "~"),
 		strings.HasSuffix(base, ".swp"),
+		strings.HasSuffix(base, ".swo"),
 		strings.HasSuffix(base, ".swx"):
 		return true
 	}

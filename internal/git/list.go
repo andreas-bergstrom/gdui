@@ -1,6 +1,7 @@
 package git
 
 import (
+	"fmt"
 	"os/exec"
 )
 
@@ -10,7 +11,7 @@ func ListAll(repoRoot string) ([]string, error) {
 	out, err := exec.Command("git", "-C", repoRoot, "-c", "core.quotepath=false",
 		"ls-files", "-z", "--cached", "--others", "--exclude-standard").Output()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("git ls-files: %w", err)
 	}
 	parts := splitNUL(out)
 	// Deduplicate (a path may appear twice if both cached and changed-on-disk).

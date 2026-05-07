@@ -2,6 +2,7 @@ package render
 
 import (
 	"bytes"
+	"strconv"
 	"strings"
 
 	"github.com/alecthomas/chroma/v2"
@@ -40,7 +41,7 @@ func Hunks(path string, hunks []git.Hunk, width int, cursor int) string {
 	}
 	if total > LargeDiffThreshold {
 		return lipgloss.NewStyle().Faint(true).Render(
-			"  … " + itoa(total) + " lines truncated; this file is too large to render inline",
+			"  … " + strconv.Itoa(total) + " lines truncated; this file is too large to render inline",
 		)
 	}
 
@@ -179,24 +180,3 @@ func truncateANSI(s string, width int) string {
 	return b.String()
 }
 
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
-}
