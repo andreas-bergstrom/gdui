@@ -11,9 +11,9 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	zone "github.com/lrstanley/bubblezone"
 
-	"github.com/andreasbergstrom/gd/internal/git"
-	"github.com/andreasbergstrom/gd/internal/render"
-	"github.com/andreasbergstrom/gd/internal/tree"
+	"github.com/andreas-bergstrom/gdui/internal/git"
+	"github.com/andreas-bergstrom/gdui/internal/render"
+	"github.com/andreas-bergstrom/gdui/internal/tree"
 )
 
 const (

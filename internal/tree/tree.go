@@ -4,7 +4,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/andreasbergstrom/gd/internal/git"
+	"github.com/andreas-bergstrom/gdui/internal/git"
 )
 
 type Node struct {

@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/andreasbergstrom/gd/internal/git"
+	"github.com/andreas-bergstrom/gdui/internal/git"
 )
 
 func sample() []git.ChangedFile {

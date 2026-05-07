@@ -6,7 +6,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/andreasbergstrom/gd/internal/search"
+	"github.com/andreas-bergstrom/gdui/internal/search"
 )
 
 // driveReady returns a Model with a ready viewport so View() doesn't bail.

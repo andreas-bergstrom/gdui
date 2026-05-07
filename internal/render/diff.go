@@ -11,7 +11,7 @@ import (
 	"github.com/alecthomas/chroma/v2/styles"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/andreasbergstrom/gd/internal/git"
+	"github.com/andreas-bergstrom/gdui/internal/git"
 )
 
 const LargeDiffThreshold = 2000

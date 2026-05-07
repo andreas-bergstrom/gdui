@@ -1,4 +1,4 @@
-module github.com/andreasbergstrom/gd
+module github.com/andreas-bergstrom/gdui
 
 go 1.23.0
 

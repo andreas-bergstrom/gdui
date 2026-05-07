@@ -10,8 +10,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/andreasbergstrom/gd/internal/ui"
-	"github.com/andreasbergstrom/gd/internal/watch"
+	"github.com/andreas-bergstrom/gdui/internal/ui"
+	"github.com/andreas-bergstrom/gdui/internal/watch"
 )
 
 func main() {

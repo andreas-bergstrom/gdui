@@ -6,7 +6,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/andreasbergstrom/gd/internal/git"
+	"github.com/andreas-bergstrom/gdui/internal/git"
 )
 
 func TestHunkLineCount_EmptyHunks(t *testing.T) {

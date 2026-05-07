@@ -8,9 +8,9 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/andreasbergstrom/gd/internal/clipboard"
-	"github.com/andreasbergstrom/gd/internal/git"
-	"github.com/andreasbergstrom/gd/internal/search"
+	"github.com/andreas-bergstrom/gdui/internal/clipboard"
+	"github.com/andreas-bergstrom/gdui/internal/git"
+	"github.com/andreas-bergstrom/gdui/internal/search"
 )
 
 // toastDuration is how long the "copied …" footer hint sticks before

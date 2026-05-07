@@ -9,8 +9,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/andreasbergstrom/gd/internal/git"
-	"github.com/andreasbergstrom/gd/internal/tree"
+	"github.com/andreas-bergstrom/gdui/internal/git"
+	"github.com/andreas-bergstrom/gdui/internal/tree"
 )
 
 // drive runs Init + the synchronous status command, then feeds a window-size
