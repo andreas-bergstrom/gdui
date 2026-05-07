@@ -49,6 +49,20 @@ Layered, all code under `internal/`:
 - The diff parser is intentionally hand-rolled and small; if you change it, update `diff_test.go` golden cases. Anchor on the `^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@` regex.
 - Mouse: only left-click and wheel events are handled. `tea.MouseActionPress` + `MouseButtonLeft` toggles the row; `MouseButtonWheelUp/Down` scrolls the viewport by 3 lines.
 
+## Release pipeline
+
+Releases are produced by `.github/workflows/release.yml`, triggered on `v*` tag pushes. Do **not** manually build and upload artifacts — tag the commit, push the tag, the workflow does the rest.
+
+- `.goreleaser.yaml` is the source of truth for build matrix, archives, checksums, signing, and Homebrew formula. Modify there, not in the workflow.
+- The build matrix is the `goos` × `goarch` cartesian product in `builds[0]`, with `windows/arm64` carved out via `ignore:`. To add a target, add it to the lists; to add a Linux package format (`.deb`/`.rpm`), add an `nfpms:` block — make sure the signing post-hook still no-ops on the new target.
+- `main.version`, `main.commit`, `main.date` are package-level vars in `main.go` injected via `-ldflags '-X main.version=…'` at build time. The defaults (`"dev"`, `"none"`, `"unknown"`) are placeholders. Do not assign them anywhere else.
+- `make build` and `make install` inject the same vars from `git describe --tags --always --dirty` so local builds know their version.
+- macOS binaries are signed + notarized by `scripts/sign-darwin.sh`, wired in as a per-build `hooks.post` in `.goreleaser.yaml`. It exits 0 on non-darwin targets, on snapshot builds, and when `QUILL_SIGN_P12` is unset — so unsigned interim releases work by simply leaving the secret empty in the workflow env.
+- Test `.goreleaser.yaml` changes locally before tagging: `goreleaser release --snapshot --clean --skip=publish`. Snapshot builds skip signing automatically, so no secrets or `quill` install are needed.
+- Six repo-level GitHub Actions secrets back the pipeline. Never reference them in commits or in `.goreleaser.yaml` literally — the workflow forwards them as env: `QUILL_SIGN_P12`, `QUILL_SIGN_PASSWORD`, `QUILL_NOTARY_KEY`, `QUILL_NOTARY_KEY_ID`, `QUILL_NOTARY_ISSUER`, `HOMEBREW_TAP_GITHUB_TOKEN`.
+- The Homebrew formula auto-publishes to a separate repo, `andreas-bergstrom/homebrew-tap`, under `Formula/gdui.rb`.
+- The `brews:` block in `.goreleaser.yaml` is deprecated by GoReleaser (in favor of `homebrew_casks:`), but Casks are macOS-only and we want Linux Homebrew support too — keep `brews:` until upstream actually drops it.
+
 ## Naming note
 
 The binary is named `gdui` (not `gd`) because `gd` collides with the common `git diff` shell alias.
