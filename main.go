@@ -14,8 +14,19 @@ import (
 	"github.com/andreas-bergstrom/gdui/internal/watch"
 )
 
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 func main() {
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Printf("gdui %s (commit %s, built %s)\n", version, commit, date)
+		return
+	}
 
 	root, err := repoRoot()
 	if err != nil {
