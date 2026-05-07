@@ -94,12 +94,3 @@ go build -o gdui .
 The UI smoke test (`internal/ui/smoke_test.go`) auto-skips if `/tmp/gd-smoke` (or `$GD_SMOKE_REPO`) is not a git repo. To exercise it, populate that directory with a dirty repo first.
 
 See `CLAUDE.md` for the architecture overview.
-
-## Limitations
-
-Out of scope for now (intentional):
-
-- Configurable diff base — only working tree vs `HEAD` is supported. No branch / commit comparison.
-- Hunk staging — this is a viewer, not `git add -p`.
-- Side-by-side (split) diff view.
-- Search / filter by filename.
