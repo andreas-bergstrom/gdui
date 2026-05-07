@@ -25,11 +25,36 @@ A focused terminal UI for browsing your working-tree git diff as a sparse, colla
 
 ## Install
 
+### Homebrew (macOS, Linux)
+
 ```sh
-git clone <repo> && cd ui
-go build -o gdui .
-# optionally
-ln -s "$PWD/gdui" /usr/local/bin/gdui
+brew install andreas-bergstrom/tap/gdui
+```
+
+macOS binaries are signed with my Developer ID and notarized — no Gatekeeper warning on first run.
+
+### Pre-built binaries
+
+Grab the archive for your platform from the [latest release](https://github.com/andreas-bergstrom/gdui/releases/latest):
+
+- `gdui_<version>_darwin_amd64.tar.gz` / `gdui_<version>_darwin_arm64.tar.gz`
+- `gdui_<version>_linux_amd64.tar.gz` / `gdui_<version>_linux_arm64.tar.gz`
+- `gdui_<version>_windows_amd64.zip`
+
+Extract and put the `gdui` binary somewhere on your `PATH`. `checksums.txt` is published alongside for verification.
+
+### From source
+
+```sh
+go install github.com/andreas-bergstrom/gdui@latest
+```
+
+Or clone and build:
+
+```sh
+git clone https://github.com/andreas-bergstrom/gdui.git
+cd gdui
+make install         # installs to ~/.local/bin/gdui
 ```
 
 Requires Go 1.23+ and `git` on `PATH`.
