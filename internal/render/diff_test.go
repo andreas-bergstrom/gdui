@@ -9,6 +9,36 @@ import (
 	"github.com/andreas-bergstrom/gdui/internal/git"
 )
 
+// TestHighlight_NoEmbeddedNewlines guards against chroma's terminal16m
+// formatter slipping a "\n\x1b[0m" tail into per-diff-line output for inputs
+// that don't carry a trailing newline (i.e. every line we hand it). An
+// embedded newline turns one logical diff row into two visual rows, breaking
+// scroll math and the per-row cursor highlight.
+func TestHighlight_NoEmbeddedNewlines(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+		in   string
+	}{
+		{"go-comment", "foo.go", "// a single line comment"},
+		{"go-code", "foo.go", "func bar() error { return nil }"},
+		{"py-comment", "foo.py", "# python comment"},
+		{"plain-text", "README.md", "Hello, world."},
+		{"empty", "foo.go", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := Hunks("foo.go", []git.Hunk{
+				{Header: "@@ -0,0 +1,1 @@", Lines: []git.DiffLine{{Kind: '+', Text: tc.in}}},
+			}, 80, -1)
+			// One hunk header + one content line = 2 lines, no more.
+			if got := strings.Count(out, "\n"); got != 1 {
+				t.Errorf("rendered diff has %d newlines (want 1) — chroma is leaking embedded \\n; raw=%q", got, out)
+			}
+		})
+	}
+}
+
 func TestHunkLineCount_EmptyHunks(t *testing.T) {
 	if c := HunkLineCount(nil); c != 0 {
 		t.Errorf("HunkLineCount(nil) = %d, want 0", c)

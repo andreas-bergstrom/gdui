@@ -133,9 +133,14 @@ func highlight(lex chroma.Lexer, text string) string {
 	if err := formatter.Format(&buf, chromaSty, it); err != nil {
 		return text
 	}
-	// Strip trailing reset+newline that the terminal formatter sometimes adds.
+	// Chroma's terminal formatter emits a stray `\n\x1b[0m` tail when the
+	// tokenised input has no trailing newline (i.e. for every diff line we
+	// hand it). Strip *all* newlines — input is a single source line, so
+	// the rendered output must be a single visual line. Leaving any `\n`
+	// intact inflates the apparent diff height to ~2× and breaks cursorY
+	// scroll math + per-line cursor highlighting.
 	out := buf.String()
-	out = strings.TrimRight(out, "\n")
+	out = strings.ReplaceAll(out, "\n", "")
 	return out
 }
 
