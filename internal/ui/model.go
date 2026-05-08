@@ -53,29 +53,46 @@ func (m viewMode) String() string {
 }
 
 type Model struct {
+	// repoRoot is the worktree gdui was launched in. Used to identify the
+	// "active" section initially and as a fallback root for git operations
+	// before sections have loaded.
 	repoRoot string
 	mode     viewMode
 
-	// tree state — used in Changed/All/Commit modes
-	root       *tree.Node
-	rows       []*tree.Node
+	// sections drive ModeChanged/ModeAll rendering. In ModeLog/ModeCommit/
+	// ModeFileLog, sections only determine which worktree's data is shown
+	// via activeWT.
+	sections []*WorktreeSection
+	activeWT int
+
+	// rows is the unified flat row list rendered in the current mode.
+	rows       []displayRow
 	cursor     int
 	diffCursor int // line index inside the expanded file at `cursor`; -1 = on the file row itself
 
-	// log state — used in Log mode
+	// commitTree is the tree for the currently-selected commit (ModeCommit).
+	// Independent of sections — a commit belongs to exactly one worktree at a
+	// time and survives section reorders.
+	commitTree *tree.Node
+
+	// log state — used in Log / FileLog modes; always belongs to the active
+	// section's worktree.
 	commits      []git.Commit
 	commitCursor int
-	logLoaded    bool // true once a logMsg has been processed (distinguishes "loading" from "empty repo")
+	logLoaded    bool
+	logRoot      string // worktree the m.commits belong to (for stale-msg drop)
 
 	// commit drill-in state — set when mode == ModeCommit
 	selectedSHA     string
 	selectedShort   string
 	selectedSubject string
+	selectedRoot    string // worktree the selected commit belongs to
 
 	// file-log state — set when mode == ModeFileLog
 	fileLogPath  string
-	prevTreeMode viewMode // ModeChanged or ModeAll, to return to from ModeFileLog
-	commitParent viewMode // ModeLog or ModeFileLog, to return to from ModeCommit
+	fileLogRoot  string // section root that owns fileLogPath
+	prevTreeMode viewMode
+	commitParent viewMode
 
 	vp       viewport.Model
 	width    int
@@ -85,8 +102,10 @@ type Model struct {
 	showHelp bool
 	ready    bool
 
-	// search holds everything specific to ModeSearch (input, cached path
-	// index, current results, cursor, transient toast). See search.go.
+	// initialized flips to true after the first initDataMsg so we know
+	// whether to auto-position the cursor on the launch-cwd's section.
+	initialized bool
+
 	search searchState
 }
 
@@ -94,72 +113,115 @@ func New(repoRoot string) Model {
 	return Model{
 		repoRoot:   repoRoot,
 		mode:       ModeChanged,
-		root:       &tree.Node{IsDir: true, Expanded: true},
 		zones:      zone.New(),
 		diffCursor: -1,
 	}
 }
 
 func (m Model) Init() tea.Cmd {
-	return loadStatusCmd(m.repoRoot, false)
+	return loadInitDataCmd(m.repoRoot, false)
 }
 
 // --- messages ---
 
 // RefreshMsg can be sent externally (e.g. from a file watcher) to trigger a
-// reload of the diff state. Ignored in Log/Commit modes.
-type RefreshMsg struct{}
+// per-worktree status reload. An empty Root means "manual refresh — re-list
+// worktrees and reload everything." Ignored in Log/FileLog/Commit modes
+// (those views aren't tied to working-tree state).
+type RefreshMsg struct {
+	Root string
+}
+
+// initDataMsg carries one synchronous batch of worktree discovery + per-section
+// status loads. Used at startup and on full manual refresh, where loading
+// everything in one cmd avoids the test/runtime complexity of tea.Batch fan-out.
+type initDataMsg struct {
+	worktrees []git.Worktree
+	statuses  map[string]sectionStatus
+	allMode   bool
+	err       error
+}
+
+type sectionStatus struct {
+	files []git.ChangedFile
+	tree  *tree.Node
+	err   error
+}
 
 type statusMsg struct {
-	root *tree.Node
-	err  error
+	root  string
+	files []git.ChangedFile
+	tree  *tree.Node
+	err   error
 }
 
 type logMsg struct {
+	root    string
 	commits []git.Commit
 	err     error
 }
 
 type commitTreeMsg struct {
+	root string
 	sha  string
-	root *tree.Node
+	tree *tree.Node
 	err  error
 }
 
 type hunksMsg struct {
+	root  string
 	path  string
 	hunks []git.Hunk
 	err   error
 }
 
+func loadInitDataCmd(repoRoot string, allMode bool) tea.Cmd {
+	return func() tea.Msg {
+		wts, err := git.ListWorktrees(repoRoot)
+		if err != nil {
+			return initDataMsg{err: err, allMode: allMode}
+		}
+		statuses := map[string]sectionStatus{}
+		for _, wt := range wts {
+			statuses[wt.Root] = loadSectionStatus(wt.Root, allMode)
+		}
+		return initDataMsg{worktrees: wts, statuses: statuses, allMode: allMode}
+	}
+}
+
 func loadStatusCmd(root string, allMode bool) tea.Cmd {
 	return func() tea.Msg {
-		files, err := git.Status(root)
-		if err != nil {
-			return statusMsg{err: err}
-		}
-		if !allMode {
-			return statusMsg{root: tree.Build(files)}
-		}
-		all, err := git.ListAll(root)
-		if err != nil {
-			return statusMsg{err: err}
-		}
-		return statusMsg{root: tree.BuildAll(files, all)}
+		st := loadSectionStatus(root, allMode)
+		return statusMsg{root: root, files: st.files, tree: st.tree, err: st.err}
 	}
+}
+
+func loadSectionStatus(root string, allMode bool) sectionStatus {
+	files, err := git.Status(root)
+	if err != nil {
+		return sectionStatus{err: err}
+	}
+	if !allMode {
+		return sectionStatus{files: files, tree: tree.Build(files)}
+	}
+	all, err := git.ListAll(root)
+	if err != nil {
+		return sectionStatus{files: files, err: err}
+	}
+	return sectionStatus{files: files, tree: tree.BuildAll(files, all)}
 }
 
 func loadLogCmd(root string) tea.Cmd {
 	return func() tea.Msg {
 		c, err := git.Log(root, logLimit)
-		return logMsg{commits: c, err: err}
+		return logMsg{root: root, commits: c, err: err}
 	}
 }
 
 func loadFileLogCmd(root, path string) tea.Cmd {
 	return func() tea.Msg {
 		c, err := git.LogForPath(root, path, logLimit)
-		return logMsg{commits: c, err: err}
+		return logMsg{root: root, commits: c, err: err}
 	}
 }
 
@@ -167,22 +229,22 @@ func loadCommitTreeCmd(root, sha string) tea.Cmd {
 	return func() tea.Msg {
 		files, err := git.CommitFiles(root, sha)
 		if err != nil {
-			return commitTreeMsg{sha: sha, err: err}
+			return commitTreeMsg{root: root, sha: sha, err: err}
 		}
-		return commitTreeMsg{sha: sha, root: tree.Build(files)}
+		return commitTreeMsg{root: root, sha: sha, tree: tree.Build(files)}
 	}
 }
 
-func loadHunksCmd(repoRoot, path string, file git.ChangedFile, sha string) tea.Cmd {
+func loadHunksCmd(root, path string, file git.ChangedFile, sha string) tea.Cmd {
 	return func() tea.Msg {
 		var hs []git.Hunk
 		var err error
 		if sha == "" {
-			hs, err = git.LoadHunks(repoRoot, file)
+			hs, err = git.LoadHunks(root, file)
 		} else {
-			hs, err = git.CommitHunks(repoRoot, sha, file.Path)
+			hs, err = git.CommitHunks(root, sha, file.Path)
 		}
-		return hunksMsg{path: path, hunks: hs, err: err}
+		return hunksMsg{root: root, path: path, hunks: hs, err: err}
 	}
 }
 
@@ -204,87 +266,94 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case RefreshMsg:
-		// File-watcher triggered refresh. The cached path index used by
-		// ModeSearch is potentially stale once files appear/disappear; mark
-		// it for reload regardless of the current mode.
+		// File-watcher triggered. Cached search index is potentially stale.
 		m.search.pathsReady = false
 		m.search.paths = nil
 		switch m.mode {
 		case ModeChanged, ModeAll:
-			return m, loadStatusCmd(m.repoRoot, m.mode == ModeAll)
+			if msg.Root == "" {
+				return m, loadInitDataCmd(m.repoRoot, m.mode == ModeAll)
+			}
+			// Per-section refresh from a watcher; only reload the affected one.
+			if findSectionByRoot(m.sections, msg.Root) < 0 {
+				return m, nil
+			}
+			return m, loadStatusCmd(msg.Root, m.mode == ModeAll)
 		case ModeLog:
-			return m, loadLogCmd(m.repoRoot)
+			return m, loadLogCmd(m.activeRoot())
 		case ModeFileLog:
 			if m.fileLogPath != "" {
-				return m, loadFileLogCmd(m.repoRoot, m.fileLogPath)
+				return m, loadFileLogCmd(m.fileLogRoot, m.fileLogPath)
 			}
 		case ModeSearch:
 			return m, loadSearchPathsCmd(m.repoRoot)
 		}
-		// ModeCommit: a single commit's contents are immutable; nothing to do.
 		return m, nil
 
-	case statusMsg:
+	case initDataMsg:
 		if msg.err != nil {
 			m.err = msg.err
 			return m, nil
 		}
 		m.err = nil
-		// Preserve the cursor's path across reloads so a watcher-triggered
-		// refresh while editing doesn't yank the cursor back to the top.
-		var prevPath string
-		if c := m.currentNode(); c != nil {
-			prevPath = c.Path
-		}
-		m.preserveStateInto(msg.root)
-		m.root = msg.root
-		m.rows = tree.Flatten(m.root)
-		prevDiffCursor := m.diffCursor
-		m.cursor = 0
-		m.diffCursor = -1
-		if prevPath != "" {
-			for i, r := range m.rows {
-				if r.Path == prevPath {
-					m.cursor = i
-					m.diffCursor = prevDiffCursor // keep in-diff position on the same file
-					break
-				}
-			}
-		}
+		firstInit := !m.initialized
+		m.initialized = true
+		m.applyInitData(msg)
 		m.refreshView()
-		// Async-refetch hunks for files that are still expanded so their
-		// diffs reflect the new working tree. Old hunks remain visible until
-		// the new ones arrive, so there's no "loading" flicker.
-		var cmds []tea.Cmd
-		var walk func(n *tree.Node)
-		walk = func(n *tree.Node) {
-			if !n.IsDir && n.Expanded && n.File != nil && !n.File.Binary {
-				cmds = append(cmds, loadHunksCmd(m.repoRoot, n.Path, *n.File, ""))
-			}
-			for _, c := range n.Children {
-				walk(c)
-			}
+		if firstInit {
+			m.positionCursorOnActiveSection()
+			m.ensureCursorVisible()
 		}
-		walk(m.root)
-		if len(cmds) == 0 {
+		return m, m.refreshExpandedHunks()
+
+	case statusMsg:
+		idx := findSectionByRoot(m.sections, msg.root)
+		if idx < 0 {
+			return m, nil // section was removed mid-flight
+		}
+		s := m.sections[idx]
+		if msg.err != nil {
+			s.LoadErr = msg.err
+			s.Files = nil
+			s.Root = nil
+			m.refreshView()
 			return m, nil
 		}
-		return m, tea.Batch(cmds...)
+		// Preserve in-section expand state across reloads.
+		preserveTreeState(s.Root, msg.tree)
+		prevPath := m.cursorPath()
+		s.Files = msg.files
+		s.Root = msg.tree
+		s.LoadErr = nil
+		if !s.firstLoadDone {
+			s.firstLoadDone = true
+			if sectionHasChanges(s) || idx == m.activeWT {
+				s.Expanded = true
+			}
+		}
+		m.err = nil
+		prevDiffCursor := m.diffCursor
+		m.refreshView()
+		m.restoreCursorByPath(prevPath, prevDiffCursor)
+		return m, m.refreshExpandedHunks()
 
 	case logMsg:
+		// Stale-message drop: a tab-switch may have changed the active section.
+		if msg.root != m.activeRoot() {
+			return m, nil
+		}
 		if msg.err != nil {
 			m.err = msg.err
 			return m, nil
 		}
 		m.err = nil
-		// Preserve the cursor's SHA across reloads so a watcher-triggered
-		// refresh (new commit) doesn't yank the cursor off the user's row.
 		var prevSHA string
 		if m.commitCursor >= 0 && m.commitCursor < len(m.commits) {
 			prevSHA = m.commits[m.commitCursor].SHA
 		}
 		m.commits = msg.commits
 		m.logLoaded = true
+		m.logRoot = msg.root
 		m.commitCursor = 0
 		if prevSHA != "" {
 			for i, c := range m.commits {
@@ -302,24 +371,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = msg.err
 			return m, nil
 		}
-		// Ignore stale responses (user already navigated away).
-		if msg.sha != m.selectedSHA {
+		// Ignore stale responses (user navigated away).
+		if msg.sha != m.selectedSHA || msg.root != m.selectedRoot {
 			return m, nil
 		}
 		m.err = nil
-		m.root = msg.root
+		m.commitTree = msg.tree
 		m.cursor = 0
 		m.refreshView()
 		return m, nil
 
 	case hunksMsg:
-		// Resolve by path against the current tree — the tree may have been
-		// rebuilt by a refresh while the hunk load was in flight, in which
-		// case the original *tree.Node pointer would be stale.
-		if n := tree.FindByPath(m.root, msg.path); n != nil && !n.IsDir {
-			// Capture the cursor's y BEFORE the hunk count changes so we can
-			// shift YOffset by the same delta — otherwise inserting N diff
-			// lines above the cursor pushes it visually off-screen.
+		var n *tree.Node
+		// In commit mode, look up in m.commitTree; otherwise look up in the
+		// originating section.
+		if m.mode == ModeCommit && msg.root == m.selectedRoot {
+			n = tree.FindByPath(m.commitTree, msg.path)
+		} else if idx := findSectionByRoot(m.sections, msg.root); idx >= 0 {
+			n = tree.FindByPath(m.sections[idx].Root, msg.path)
+		}
+		if n != nil && !n.IsDir {
 			prevY := m.cursorY()
 			n.Loading = false
 			n.LoadErr = msg.err
@@ -346,7 +417,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case searchResultMsg:
-		// Drop stale results — a newer query may already be in-flight.
 		if msg.seq != m.search.pendingQ {
 			return m, nil
 		}
@@ -370,7 +440,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case clipboardToastExpiredMsg:
-		// Only clear the toast if no newer copy has happened since.
 		if msg.seq == m.search.toastSeq {
 			m.search.toast = ""
 			m.refreshView()
@@ -386,12 +455,117 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// applyInitData rebuilds the section list from a fresh worktree discovery,
+// preserving per-section expand state and per-node expand/hunk state where
+// the worktree root survives the refresh.
+func (m *Model) applyInitData(msg initDataMsg) {
+	prev := m.sections
+	newSecs := make([]*WorktreeSection, 0, len(msg.worktrees))
+	for _, wt := range msg.worktrees {
+		st := msg.statuses[wt.Root]
+		var prevSec *WorktreeSection
+		if i := findSectionByRoot(prev, wt.Root); i >= 0 {
+			prevSec = prev[i]
+		}
+		s := &WorktreeSection{WT: wt}
+		if prevSec != nil {
+			s.Expanded = prevSec.Expanded
+			s.firstLoadDone = prevSec.firstLoadDone
+			preserveTreeState(prevSec.Root, st.tree)
+		} else {
+			s.Expanded = wt.Root == m.repoRoot // active worktree opens by default
+		}
+		s.Files = st.files
+		s.Root = st.tree
+		s.LoadErr = st.err
+		if !s.firstLoadDone {
+			s.firstLoadDone = true
+			if len(st.files) > 0 || wt.Root == m.repoRoot {
+				s.Expanded = true
+			}
+		}
+		newSecs = append(newSecs, s)
+	}
+	m.sections = newSecs
+	// activeWT: pick the section matching launch root, else clamp.
+	m.activeWT = 0
+	for i, s := range m.sections {
+		if s.WT.Root == m.repoRoot {
+			m.activeWT = i
+			break
+		}
+	}
+}
+
+// preserveTreeState copies expand state and cached hunks from old to new
+// keyed by Path, so a refresh doesn't drop the user's open files or flicker.
+func preserveTreeState(old, new *tree.Node) {
+	if old == nil || new == nil {
+		return
+	}
+	type snap struct {
+		expanded bool
+		hunks    []git.Hunk
+	}
+	snaps := map[string]snap{}
+	var collect func(n *tree.Node)
+	collect = func(n *tree.Node) {
+		if n.Path != "" {
+			snaps[n.Path] = snap{expanded: n.Expanded, hunks: n.Hunks}
+		}
+		for _, c := range n.Children {
+			collect(c)
+		}
+	}
+	collect(old)
+	var apply func(n *tree.Node)
+	apply = func(n *tree.Node) {
+		if s, ok := snaps[n.Path]; ok && n.Path != "" {
+			n.Expanded = s.expanded
+			n.Hunks = s.hunks
+		}
+		for _, c := range n.Children {
+			apply(c)
+		}
+	}
+	apply(new)
+}
+
+// refreshExpandedHunks kicks off async hunk reloads for every file that's
+// currently expanded, across all sections (or the commit tree in commit mode).
+func (m *Model) refreshExpandedHunks() tea.Cmd {
+	var cmds []tea.Cmd
+	walk := func(root, sha string, n *tree.Node) {
+		var visit func(*tree.Node)
+		visit = func(n *tree.Node) {
+			if !n.IsDir && n.Expanded && n.File != nil && !n.File.Binary {
+				cmds = append(cmds, loadHunksCmd(root, n.Path, *n.File, sha))
+			}
+			for _, c := range n.Children {
+				visit(c)
+			}
+		}
+		if n != nil {
+			visit(n)
+		}
+	}
+	if m.mode == ModeCommit && m.selectedRoot != "" && m.commitTree != nil {
+		walk(m.selectedRoot, m.selectedSHA, m.commitTree)
+	} else {
+		for _, s := range m.sections {
+			walk(s.WT.Root, "", s.Root)
+		}
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
+}
+
+// --- key handling ---
+
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	// Search mode owns its own input (printable runes go into the query),
-	// so dispatch to it before consulting the global bindings — the user
-	// must be able to type 'q', 'r', '/', 'a', etc. without triggering them.
 	if m.mode == ModeSearch {
-		// Allow ctrl+c to still quit and ? to still toggle help.
 		if msg.Type == tea.KeyCtrlC {
 			return m, tea.Quit
 		}
@@ -433,11 +607,11 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *Model) handleKeyTree(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
 	case key.Matches(msg, keys.Blame):
-		n := m.currentNode()
+		n := m.currentTreeNode()
 		if n == nil || n.IsDir || n.File == nil {
 			return *m, nil
 		}
-		return *m, m.openFileLog(n.Path)
+		return *m, m.openFileLog(m.currentSectionRoot(), n.Path)
 	case key.Matches(msg, keys.Down):
 		m.moveDown()
 	case key.Matches(msg, keys.Up):
@@ -450,10 +624,10 @@ func (m *Model) handleKeyTree(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.moveCursor(-m.vp.Height / 2)
 	case key.Matches(msg, keys.NextDir):
 		m.diffCursor = -1
-		m.jumpDir(1)
+		m.jumpGroup(1)
 	case key.Matches(msg, keys.PrevDir):
 		m.diffCursor = -1
-		m.jumpDir(-1)
+		m.jumpGroup(-1)
 	case key.Matches(msg, keys.Top):
 		m.cursor = 0
 		m.diffCursor = -1
@@ -463,41 +637,47 @@ func (m *Model) handleKeyTree(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.diffCursor = -1
 		m.refreshViewToCursor()
 	case key.Matches(msg, keys.Toggle):
-		return *m, m.toggle(m.currentNode())
+		return *m, m.toggle(m.currentRow())
 	case key.Matches(msg, keys.Right):
-		n := m.currentNode()
-		if n != nil && !n.Expanded {
-			return *m, m.toggle(n)
+		if r, ok := m.currentRow().(treeRow); ok && r.node != nil && !r.node.Expanded {
+			return *m, m.toggle(r)
+		}
+		if r, ok := m.currentRow().(headerRow); ok && r.sectionIdx >= 0 && r.sectionIdx < len(m.sections) && !m.sections[r.sectionIdx].Expanded {
+			return *m, m.toggle(r)
 		}
 	case key.Matches(msg, keys.Left):
-		n := m.currentNode()
-		if n == nil {
-			return *m, nil
-		}
-		// In-diff cursor or expanded file → collapse.
-		if n.Expanded {
-			return *m, m.toggle(n)
-		}
-		if n.Parent != nil && n.Parent.Parent != nil {
-			for i, r := range m.rows {
-				if r == n.Parent {
-					m.cursor = i
-					break
-				}
+		switch r := m.currentRow().(type) {
+		case treeRow:
+			n := r.node
+			if n == nil {
+				return *m, nil
 			}
-			m.diffCursor = -1
-			m.refreshViewToCursor()
+			if n.Expanded {
+				return *m, m.toggle(r)
+			}
+			if n.Parent != nil && n.Parent.Parent != nil {
+				for i, dr := range m.rows {
+					if t, ok := dr.(treeRow); ok && t.node == n.Parent {
+						m.cursor = i
+						break
+					}
+				}
+				m.diffCursor = -1
+				m.refreshViewToCursor()
+			}
+		case headerRow:
+			if r.sectionIdx >= 0 && r.sectionIdx < len(m.sections) && m.sections[r.sectionIdx].Expanded {
+				return *m, m.toggle(r)
+			}
 		}
 	}
 	return *m, nil
 }
 
-// moveDown advances one step. If the cursor is on an expanded file with
-// rendered diff content, it walks through the diff lines first; once past the
-// last diff line, it moves to the next tree row.
+// moveDown advances one step. If the cursor is on an expanded file with diff
+// content, walk through diff lines first; otherwise move to the next row.
 func (m *Model) moveDown() {
-	n := m.currentNode()
-	if n != nil && !n.IsDir && n.Expanded {
+	if n := m.currentTreeNode(); n != nil && !n.IsDir && n.Expanded {
 		if max := diffNavCount(n); max > 0 {
 			if m.diffCursor < max-1 {
 				m.diffCursor++
@@ -510,7 +690,6 @@ func (m *Model) moveDown() {
 	m.moveCursor(1)
 }
 
-// moveUp is the inverse of moveDown.
 func (m *Model) moveUp() {
 	if m.diffCursor > 0 {
 		m.diffCursor--
@@ -525,8 +704,6 @@ func (m *Model) moveUp() {
 	m.moveCursor(-1)
 }
 
-// diffNavCount is the number of diff lines navigable inside an expanded file.
-// Returns 0 when there's nothing to navigate (loading, binary, error, no diff).
 func diffNavCount(n *tree.Node) int {
 	if n == nil || n.IsDir || n.File == nil {
 		return 0
@@ -539,6 +716,10 @@ func diffNavCount(n *tree.Node) int {
 
 func (m *Model) handleKeyLog(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
+	case key.Matches(msg, keys.NextWorktree):
+		return *m, m.cycleActiveWorktree(1)
+	case key.Matches(msg, keys.PrevWorktree):
+		return *m, m.cycleActiveWorktree(-1)
 	case key.Matches(msg, keys.Down):
 		m.moveCommitCursor(1)
 	case key.Matches(msg, keys.Up):
@@ -583,47 +764,43 @@ func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 		return *m, nil
 	}
-	for i, n := range m.rows {
-		if n == nil {
-			continue
-		}
-		if z := m.zones.Get(zoneID(i)); z.InBounds(msg) {
-			m.cursor = i
-			m.diffCursor = -1
-			return *m, m.toggle(n)
+	for i, r := range m.rows {
+		switch row := r.(type) {
+		case headerRow:
+			if z := m.zones.Get(headerZoneID(row.sectionIdx)); z.InBounds(msg) {
+				m.cursor = i
+				m.diffCursor = -1
+				return *m, m.toggle(row)
+			}
+		case treeRow:
+			if row.node == nil {
+				continue
+			}
+			if z := m.zones.Get(zoneID(i)); z.InBounds(msg) {
+				m.cursor = i
+				m.diffCursor = -1
+				return *m, m.toggle(row)
+			}
 		}
 	}
 	return *m, nil
 }
 
-// --- mode + commit navigation ---
-
-// resetTree clears tree-mode view state. Called when switching into a mode
-// that renders something other than the working-tree diff.
-func (m *Model) resetTree() {
-	m.root = &tree.Node{IsDir: true, Expanded: true}
-	m.rows = nil
-	m.cursor = 0
-	m.diffCursor = -1
-}
-
-func (m *Model) clearSelectedCommit() {
-	m.selectedSHA = ""
-	m.selectedShort = ""
-	m.selectedSubject = ""
-}
+// --- mode + selection navigation ---
 
 func (m *Model) cycleMode() tea.Cmd {
 	m.vp.SetYOffset(0)
 	switch m.mode {
 	case ModeChanged:
 		m.mode = ModeAll
-		return loadStatusCmd(m.repoRoot, true)
+		return m.reloadAllSections(true)
 	case ModeAll:
 		m.mode = ModeLog
-		m.resetTree()
-		if !m.logLoaded {
-			return loadLogCmd(m.repoRoot)
+		m.commitTree = nil
+		m.cursor = 0
+		m.diffCursor = -1
+		if !m.logLoaded || m.logRoot != m.activeRoot() {
+			return loadLogCmd(m.activeRoot())
 		}
 		m.refreshView()
 		return nil
@@ -631,9 +808,44 @@ func (m *Model) cycleMode() tea.Cmd {
 		m.mode = ModeChanged
 		m.clearSelectedCommit()
 		m.fileLogPath = ""
-		return loadStatusCmd(m.repoRoot, false)
+		m.fileLogRoot = ""
+		return m.reloadAllSections(false)
 	}
 	return nil
+}
+
+func (m *Model) reloadAllSections(allMode bool) tea.Cmd {
+	if len(m.sections) == 0 {
+		return loadInitDataCmd(m.repoRoot, allMode)
+	}
+	cmds := make([]tea.Cmd, 0, len(m.sections))
+	for _, s := range m.sections {
+		cmds = append(cmds, loadStatusCmd(s.WT.Root, allMode))
+	}
+	return tea.Batch(cmds...)
+}
+
+func (m *Model) cycleActiveWorktree(d int) tea.Cmd {
+	if len(m.sections) <= 1 {
+		return nil
+	}
+	m.activeWT = (m.activeWT + d + len(m.sections)) % len(m.sections)
+	m.commitCursor = 0
+	m.commits = nil
+	m.logLoaded = false
+	m.refreshView()
+	if m.mode == ModeFileLog {
+		return loadFileLogCmd(m.activeRoot(), m.fileLogPath)
+	}
+	return loadLogCmd(m.activeRoot())
+}
+
+func (m *Model) clearSelectedCommit() {
+	m.selectedSHA = ""
+	m.selectedShort = ""
+	m.selectedSubject = ""
+	m.selectedRoot = ""
+	m.commitTree = nil
 }
 
 func (m *Model) openCommit() tea.Cmd {
@@ -646,10 +858,13 @@ func (m *Model) openCommit() tea.Cmd {
 	m.selectedSHA = c.SHA
 	m.selectedShort = c.ShortSHA
 	m.selectedSubject = c.Subject
-	m.resetTree()
+	m.selectedRoot = m.activeRoot()
+	m.commitTree = nil
+	m.cursor = 0
+	m.diffCursor = -1
 	m.vp.SetYOffset(0)
 	m.refreshView()
-	return loadCommitTreeCmd(m.repoRoot, c.SHA)
+	return loadCommitTreeCmd(m.selectedRoot, c.SHA)
 }
 
 func (m *Model) exitCommit() tea.Cmd {
@@ -664,17 +879,19 @@ func (m *Model) exitCommit() tea.Cmd {
 	return nil
 }
 
-func (m *Model) openFileLog(path string) tea.Cmd {
+func (m *Model) openFileLog(root, path string) tea.Cmd {
 	m.prevTreeMode = m.mode
 	m.mode = ModeFileLog
 	m.fileLogPath = path
-	m.resetTree()
+	m.fileLogRoot = root
 	m.commits = nil
 	m.commitCursor = 0
 	m.logLoaded = false
+	m.cursor = 0
+	m.diffCursor = -1
 	m.vp.SetYOffset(0)
 	m.refreshView()
-	return loadFileLogCmd(m.repoRoot, path)
+	return loadFileLogCmd(root, path)
 }
 
 func (m *Model) exitFileLog() tea.Cmd {
@@ -684,27 +901,28 @@ func (m *Model) exitFileLog() tea.Cmd {
 	}
 	m.mode = prev
 	m.fileLogPath = ""
+	m.fileLogRoot = ""
 	m.commits = nil
 	m.logLoaded = false
 	m.vp.SetYOffset(0)
-	return loadStatusCmd(m.repoRoot, prev == ModeAll)
+	return m.reloadAllSections(prev == ModeAll)
 }
 
 func (m *Model) refreshCmd() tea.Cmd {
 	switch m.mode {
 	case ModeChanged:
-		return loadStatusCmd(m.repoRoot, false)
+		return loadInitDataCmd(m.repoRoot, false)
 	case ModeAll:
-		return loadStatusCmd(m.repoRoot, true)
+		return loadInitDataCmd(m.repoRoot, true)
 	case ModeLog:
-		return loadLogCmd(m.repoRoot)
+		return loadLogCmd(m.activeRoot())
 	case ModeFileLog:
 		if m.fileLogPath != "" {
-			return loadFileLogCmd(m.repoRoot, m.fileLogPath)
+			return loadFileLogCmd(m.fileLogRoot, m.fileLogPath)
 		}
 	case ModeCommit:
 		if m.selectedSHA != "" {
-			return loadCommitTreeCmd(m.repoRoot, m.selectedSHA)
+			return loadCommitTreeCmd(m.selectedRoot, m.selectedSHA)
 		}
 	}
 	return nil
@@ -712,14 +930,92 @@ func (m *Model) refreshCmd() tea.Cmd {
 
 // --- helpers ---
 
-func (m *Model) currentNode() *tree.Node {
+func (m *Model) currentRow() displayRow {
 	if m.cursor < 0 || m.cursor >= len(m.rows) {
 		return nil
 	}
 	return m.rows[m.cursor]
 }
 
-func (m *Model) toggle(n *tree.Node) tea.Cmd {
+func (m *Model) currentTreeNode() *tree.Node {
+	if r, ok := m.currentRow().(treeRow); ok {
+		return r.node
+	}
+	return nil
+}
+
+// currentSectionRoot returns the worktree root of the section the cursor
+// currently points into (tree row or header). Falls back to the active
+// worktree's root for non-section rows.
+func (m *Model) currentSectionRoot() string {
+	switch r := m.currentRow().(type) {
+	case treeRow:
+		if r.sectionIdx >= 0 && r.sectionIdx < len(m.sections) {
+			return m.sections[r.sectionIdx].WT.Root
+		}
+		return m.selectedRoot
+	case headerRow:
+		if r.sectionIdx >= 0 && r.sectionIdx < len(m.sections) {
+			return m.sections[r.sectionIdx].WT.Root
+		}
+	}
+	return m.activeRoot()
+}
+
+func (m *Model) activeRoot() string {
+	if m.activeWT >= 0 && m.activeWT < len(m.sections) {
+		return m.sections[m.activeWT].WT.Root
+	}
+	return m.repoRoot
+}
+
+func (m *Model) cursorPath() string {
+	if n := m.currentTreeNode(); n != nil {
+		return n.Path
+	}
+	return ""
+}
+
+func (m *Model) restoreCursorByPath(path string, prevDiffCursor int) {
+	m.cursor = 0
+	m.diffCursor = -1
+	if path == "" {
+		return
+	}
+	for i, r := range m.rows {
+		if t, ok := r.(treeRow); ok && t.node != nil && t.node.Path == path {
+			m.cursor = i
+			m.diffCursor = prevDiffCursor
+			break
+		}
+	}
+}
+
+func (m *Model) toggle(row displayRow) tea.Cmd {
+	switch r := row.(type) {
+	case headerRow:
+		if r.sectionIdx >= 0 && r.sectionIdx < len(m.sections) {
+			s := m.sections[r.sectionIdx]
+			wasExpandedWithRows := s.Expanded && s.Root != nil && len(s.Root.Children) > 0
+			s.Expanded = !s.Expanded
+			m.diffCursor = -1
+			m.refreshViewToCursor()
+			// Collapsing a section drops a large block of rows; bubbletea's
+			// partial-redraw can leak the previously-rendered file row into
+			// place above the new content. Force a full repaint to avoid it.
+			if wasExpandedWithRows && !s.Expanded {
+				return tea.ClearScreen
+			}
+		}
+		return nil
+	case treeRow:
+		return m.toggleNode(r)
+	}
+	return nil
+}
+
+func (m *Model) toggleNode(r treeRow) tea.Cmd {
+	n := r.node
 	if n == nil {
 		return nil
 	}
@@ -733,10 +1029,23 @@ func (m *Model) toggle(n *tree.Node) tea.Cmd {
 		return nil
 	}
 	if n.Expanded {
+		// Track whether collapse will visually drop a non-trivial chunk of
+		// rows (a multi-line diff or directory contents). bubbletea's
+		// partial-redraw leaves a stale file/dir row visible above the
+		// new content in that case; tea.ClearScreen forces a clean repaint.
+		shrinking := false
+		if n.IsDir {
+			shrinking = len(n.Children) > 0
+		} else {
+			shrinking = len(n.Hunks) > 0 || n.Loading
+		}
 		n.Expanded = false
 		n.Hunks = nil
 		n.LoadErr = nil
 		m.refreshViewToCursor()
+		if shrinking {
+			return tea.ClearScreen
+		}
 		return nil
 	}
 	n.Expanded = true
@@ -746,19 +1055,59 @@ func (m *Model) toggle(n *tree.Node) tea.Cmd {
 	}
 	n.Loading = true
 	m.refreshViewToCursor()
-	return loadHunksCmd(m.repoRoot, n.Path, *n.File, m.selectedSHA)
+	root := m.rootForRowSection(r.sectionIdx)
+	return loadHunksCmd(root, n.Path, *n.File, m.selectedSHA)
 }
 
-func (m *Model) jumpDir(dir int) {
+// rootForRowSection returns the worktree root to use for git operations
+// originating at a treeRow with the given sectionIdx. -1 means "commit-tree
+// row"; the active commit's root is used.
+func (m *Model) rootForRowSection(sectionIdx int) string {
+	if sectionIdx < 0 {
+		return m.selectedRoot
+	}
+	if sectionIdx >= 0 && sectionIdx < len(m.sections) {
+		return m.sections[sectionIdx].WT.Root
+	}
+	return m.repoRoot
+}
+
+// positionCursorOnActiveSection places the cursor on the active section's
+// header in multi-worktree views so a user launching gdui from a linked
+// worktree lands on their own changes, not the main branch's.
+func (m *Model) positionCursorOnActiveSection() {
+	if !m.showSectionHeaders() {
+		return
+	}
+	for i, r := range m.rows {
+		if h, ok := r.(headerRow); ok && h.sectionIdx == m.activeWT {
+			m.cursor = i
+			return
+		}
+	}
+}
+
+// jumpGroup walks the cursor to the next/previous "grouping" row — either a
+// directory tree row OR a section header row. Mirrors the existing folder-
+// jump shortcut, extended to treat section headers as super-folders in
+// multi-worktree views.
+func (m *Model) jumpGroup(dir int) {
 	if len(m.rows) == 0 {
 		return
 	}
 	i := m.cursor + dir
 	for i >= 0 && i < len(m.rows) {
-		if m.rows[i].IsDir {
+		switch r := m.rows[i].(type) {
+		case headerRow:
 			m.cursor = i
 			m.refreshViewToCursor()
 			return
+		case treeRow:
+			if r.node != nil && r.node.IsDir {
+				m.cursor = i
+				m.refreshViewToCursor()
+				return
+			}
 		}
 		i += dir
 	}
@@ -792,47 +1141,6 @@ func (m *Model) moveCommitCursor(d int) {
 	m.refreshViewToCursor()
 }
 
-func (m *Model) preserveStateInto(newRoot *tree.Node) {
-	if m.root == nil {
-		return
-	}
-	type snap struct {
-		expanded bool
-		hunks    []git.Hunk
-	}
-	snaps := map[string]snap{}
-	var collect func(n *tree.Node)
-	collect = func(n *tree.Node) {
-		if n.Path != "" {
-			snaps[n.Path] = snap{expanded: n.Expanded, hunks: n.Hunks}
-		}
-		for _, c := range n.Children {
-			collect(c)
-		}
-	}
-	var apply func(n *tree.Node)
-	apply = func(n *tree.Node) {
-		if s, ok := snaps[n.Path]; ok && n.Path != "" {
-			n.Expanded = s.expanded
-			// Carry old hunks so the expanded view stays visible during the
-			// brief gap until refreshed hunks arrive (avoids a "no diff"
-			// flicker on every watcher-triggered reload).
-			n.Hunks = s.hunks
-		}
-		for _, c := range n.Children {
-			apply(c)
-		}
-	}
-	collect(m.root)
-	apply(newRoot)
-}
-
-// recomputeViewportHeight resizes the viewport based on the actual rendered
-// height of the header and footer. In a narrow sidebar the footer string can
-// soft-wrap to 2+ lines; if the viewport keeps assuming 1, the body overflows
-// the terminal and the bottom rows (where the cursor sits) get clipped — making
-// the cursor look like it's drifted off-screen even though the math says it's
-// visible.
 func (m *Model) recomputeViewportHeight() {
 	if !m.ready {
 		return
@@ -846,11 +1154,28 @@ func (m *Model) recomputeViewportHeight() {
 	m.vp.Height = vpH
 }
 
-// refreshView re-renders the viewport content without touching the scroll
-// position. Use this for content changes (status reload, hunk arrival) so that
-// a watcher-triggered refresh doesn't yank the viewport back to the cursor row
-// while the user is reading further down inside an expanded diff.
 func (m *Model) refreshView() {
+	// Always rebuild rows for tree/commit modes — cursor positioning logic
+	// runs before the first WindowSizeMsg arrives, when m.ready is still
+	// false. The viewport-dependent work below is gated separately.
+	if m.mode != ModeSearch && m.mode != ModeLog && m.mode != ModeFileLog {
+		m.rows = m.flattenForView()
+		debugDumpRows(m)
+		defer debugDumpFrame(m)
+		if m.cursor >= len(m.rows) {
+			m.cursor = len(m.rows) - 1
+		}
+		if m.cursor < 0 {
+			m.cursor = 0
+		}
+		if m.diffCursor >= 0 {
+			if max := diffNavCount(m.currentTreeNode()); max == 0 {
+				m.diffCursor = -1
+			} else if m.diffCursor >= max {
+				m.diffCursor = max - 1
+			}
+		}
+	}
 	if !m.ready {
 		return
 	}
@@ -869,25 +1194,25 @@ func (m *Model) refreshView() {
 		m.vp.SetContent(m.renderLog())
 		return
 	}
-	m.rows = tree.Flatten(m.root)
-	if m.cursor >= len(m.rows) {
-		m.cursor = len(m.rows) - 1
-	}
-	if m.cursor < 0 {
-		m.cursor = 0
-	}
-	if m.diffCursor >= 0 {
-		if max := diffNavCount(m.currentNode()); max == 0 {
-			m.diffCursor = -1
-		} else if m.diffCursor >= max {
-			m.diffCursor = max - 1
-		}
-	}
 	m.vp.SetContent(m.renderBody())
 }
 
-// refreshViewToCursor rebuilds and then scrolls the cursor into view. Use this
-// from explicit cursor-moving handlers (key navigation, click, expand/collapse).
+// flattenForView produces the row list for the current tree-mode view —
+// either commit tree or working-tree sections.
+func (m *Model) flattenForView() []displayRow {
+	if m.mode == ModeCommit {
+		return flattenCommitTree(m.commitTree)
+	}
+	return flattenSections(m.sections, m.showSectionHeaders())
+}
+
+// showSectionHeaders is true when the UI should render collapsible headers
+// per section. Only meaningful in tree modes; suppressed for single-worktree
+// repos so the existing single-tree UX is byte-identical.
+func (m *Model) showSectionHeaders() bool {
+	return len(m.sections) > 1 && (m.mode == ModeChanged || m.mode == ModeAll)
+}
+
 func (m *Model) refreshViewToCursor() {
 	m.refreshView()
 	if !m.ready {
@@ -904,18 +1229,15 @@ func (m *Model) ensureCursorVisible() {
 	m.scrollTo(m.cursorY())
 }
 
-// cursorY returns the line index (within the rendered body) of the cursor —
-// either the cursor's tree row or, when stepping inside an expanded file, the
-// highlighted diff line.
 func (m *Model) cursorY() int {
 	y := 0
-	for i, n := range m.rows {
+	for i, r := range m.rows {
 		if i == m.cursor {
 			break
 		}
 		y++
-		if !n.IsDir && n.Expanded {
-			y += hunkLineCount(n)
+		if t, ok := r.(treeRow); ok && t.node != nil && !t.node.IsDir && t.node.Expanded {
+			y += hunkLineCount(t.node)
 		}
 	}
 	if m.diffCursor >= 0 {
@@ -928,9 +1250,6 @@ func (m *Model) ensureCommitCursorVisible() {
 	m.scrollTo(m.commitCursor)
 }
 
-// scrollTo adjusts the viewport so line `y` (0-indexed within the rendered
-// content) is visible with a scrollOff-line margin from each edge. The margin
-// shrinks gracefully on tiny viewports.
 func (m *Model) scrollTo(y int) {
 	margin := scrollOff
 	if m.vp.Height <= 2*scrollOff+1 {
@@ -943,9 +1262,6 @@ func (m *Model) scrollTo(y int) {
 	}
 }
 
-// hunkLineCount returns the number of body lines an expanded file row will
-// occupy. For "real" diff content this is render.HunkLineCount; for placeholder
-// rows (binary, loading, error, empty) we always render one line.
 func hunkLineCount(n *tree.Node) int {
 	if n.File != nil && n.File.Binary {
 		return 1
@@ -955,7 +1271,7 @@ func hunkLineCount(n *tree.Node) int {
 	}
 	c := render.HunkLineCount(n.Hunks)
 	if c == 0 {
-		return 1 // ⟨no diff⟩ placeholder
+		return 1
 	}
 	return c
 }
@@ -1005,37 +1321,90 @@ func (m Model) footer() string {
 	if m.err != nil {
 		return errStyle.Render("error: " + m.err.Error())
 	}
+	wtCrumb := m.worktreeCrumb()
 	if m.mode == ModeLog {
 		left := fmt.Sprintf("[log] %d commits", len(m.commits))
-		return helpStyle.Render(left + " · enter open · a toggle · ? help")
+		return helpStyle.Render(left+wtCrumb+" · enter open · a toggle · ? help") +
+			helpStyle.Render(m.tabHint())
 	}
 	if m.mode == ModeFileLog {
 		left := fmt.Sprintf("[file log] %d commits · %s", len(m.commits), m.fileLogPath)
-		return helpStyle.Render(left + " · enter open · esc back · ? help")
+		return helpStyle.Render(left + wtCrumb + " · enter open · esc back · ? help")
 	}
 
 	// ModeChanged / ModeAll / ModeCommit all show file count + adds/dels totals.
-	files := 0
-	for _, n := range m.rows {
-		if !n.IsDir && n.File != nil {
-			files++
-		}
-	}
-	adds, dels := 0, 0
-	if m.root != nil {
-		adds, dels = m.root.Adds, m.root.Dels
-	}
+	files, adds, dels := m.aggregateRowStats()
 	totals := addsStyle.Render(fmt.Sprintf("+%d", adds)) + " " + delsStyle.Render(fmt.Sprintf("-%d", dels))
-
 	var left, hint string
 	if m.mode == ModeCommit {
 		left = fmt.Sprintf("[commit %s] %d files", m.selectedShort, files)
-		hint = " · esc back · ? help"
+		hint = wtCrumb + " · esc back · ? help"
 	} else {
 		left = fmt.Sprintf("[%s] %d changed", m.mode.String(), files)
-		hint = " · a toggle · ? help"
+		hint = wtCrumb + " · a toggle · ? help"
 	}
 	return helpStyle.Render(left+" · ") + totals + helpStyle.Render(hint)
+}
+
+// worktreeCrumb formats " · [worktree: <name>]" when there's more than one
+// worktree to disambiguate. Returns "" otherwise so the footer stays clean
+// for single-worktree repos.
+func (m Model) worktreeCrumb() string {
+	if len(m.sections) <= 1 {
+		return ""
+	}
+	name := ""
+	switch m.mode {
+	case ModeLog, ModeFileLog, ModeCommit:
+		if m.activeWT >= 0 && m.activeWT < len(m.sections) {
+			name = m.sections[m.activeWT].WT.Branch
+		}
+	default:
+		// Tree modes: cursor's section, fallback to active.
+		if r, ok := m.currentRow().(treeRow); ok && r.sectionIdx >= 0 && r.sectionIdx < len(m.sections) {
+			name = m.sections[r.sectionIdx].WT.Branch
+		} else if r, ok := m.currentRow().(headerRow); ok && r.sectionIdx >= 0 && r.sectionIdx < len(m.sections) {
+			name = m.sections[r.sectionIdx].WT.Branch
+		} else if m.activeWT >= 0 && m.activeWT < len(m.sections) {
+			name = m.sections[m.activeWT].WT.Branch
+		}
+	}
+	if name == "" {
+		return ""
+	}
+	return " · [worktree: " + name + "]"
+}
+
+func (m Model) tabHint() string {
+	if len(m.sections) <= 1 {
+		return ""
+	}
+	return " · tab next worktree"
+}
+
+func (m Model) aggregateRowStats() (files, adds, dels int) {
+	if m.mode == ModeCommit {
+		if m.commitTree != nil {
+			adds, dels = m.commitTree.Adds, m.commitTree.Dels
+		}
+		for _, r := range m.rows {
+			if t, ok := r.(treeRow); ok && t.node != nil && !t.node.IsDir && t.node.File != nil {
+				files++
+			}
+		}
+		return
+	}
+	for _, s := range m.sections {
+		if s.Root != nil {
+			adds += s.Root.Adds
+			dels += s.Root.Dels
+		}
+		for _, f := range s.Files {
+			_ = f
+			files++
+		}
+	}
+	return
 }
 
 func (m *Model) renderBody() string {
@@ -1049,13 +1418,20 @@ func (m *Model) renderBody() string {
 		return dimStyle.Render("  no changes")
 	}
 	var b strings.Builder
-	for i, n := range m.rows {
-		row := m.fitWidth(m.renderRow(i, n))
-		b.WriteString(m.zones.Mark(zoneID(i), row))
-		b.WriteByte('\n')
-		if !n.IsDir && n.Expanded {
-			b.WriteString(m.fitLines(m.renderExpanded(n)))
+	for i, r := range m.rows {
+		switch row := r.(type) {
+		case headerRow:
+			rendered := m.fitWidth(m.renderSectionHeader(i, row.sectionIdx))
+			b.WriteString(m.zones.Mark(headerZoneID(row.sectionIdx), rendered))
 			b.WriteByte('\n')
+		case treeRow:
+			rendered := m.fitWidth(m.renderTreeRow(i, row.node))
+			b.WriteString(m.zones.Mark(zoneID(i), rendered))
+			b.WriteByte('\n')
+			if row.node != nil && !row.node.IsDir && row.node.Expanded {
+				b.WriteString(m.fitLines(m.renderExpanded(row.node)))
+				b.WriteByte('\n')
+			}
 		}
 	}
 	return strings.TrimRight(b.String(), "\n")
@@ -1080,9 +1456,6 @@ func (m *Model) renderLog() string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// fitWidth truncates a single line to the viewport width if it would otherwise
-// soft-wrap inside the viewport (lipgloss wraps lines wider than its style
-// Width, which silently inflates rendered line count and breaks cursor-y math).
 func (m *Model) fitWidth(line string) string {
 	if m.width <= 0 || lipgloss.Width(line) <= m.width {
 		return line
@@ -1090,7 +1463,6 @@ func (m *Model) fitWidth(line string) string {
 	return render.TruncateANSI(line, m.width)
 }
 
-// fitLines applies fitWidth to every line in a multi-line block.
 func (m *Model) fitLines(block string) string {
 	if m.width <= 0 {
 		return block
@@ -1113,8 +1485,6 @@ func (m *Model) renderCommitRow(i int, c git.Commit) string {
 	return m.applyCursor(row, i == m.commitCursor)
 }
 
-// applyCursor pads `row` to full viewport width and applies cursorStyle when
-// `selected` is true; otherwise returns row unchanged.
 func (m *Model) applyCursor(row string, selected bool) string {
 	if !selected {
 		return row
@@ -1125,8 +1495,14 @@ func (m *Model) applyCursor(row string, selected bool) string {
 	return cursorStyle.Render(row)
 }
 
-func (m *Model) renderRow(i int, n *tree.Node) string {
+func (m *Model) renderTreeRow(i int, n *tree.Node) string {
+	if n == nil {
+		return ""
+	}
 	depth := tree.Depth(n)
+	if m.showSectionHeaders() {
+		depth++ // indent under the section header
+	}
 	indent := strings.Repeat("  ", depth)
 	chev := " "
 	if n.IsDir || n.File != nil {
@@ -1163,6 +1539,60 @@ func (m *Model) renderRow(i int, n *tree.Node) string {
 	return m.applyCursor(row, i == m.cursor)
 }
 
+func (m *Model) renderSectionHeader(rowIdx, sectionIdx int) string {
+	if sectionIdx < 0 || sectionIdx >= len(m.sections) {
+		return ""
+	}
+	s := m.sections[sectionIdx]
+	chev := "▾"
+	if !s.Expanded {
+		chev = "▸"
+	}
+	name := s.WT.Branch
+	if name == "" {
+		name = "(no branch)"
+	} else if name == "(detached)" && len(s.WT.HEAD) >= 7 {
+		name = "(detached @" + s.WT.HEAD[:7] + ")"
+	}
+	mods, untr := 0, 0
+	for _, f := range s.Files {
+		if f.Kind == git.Untracked {
+			untr++
+		} else {
+			mods++
+		}
+	}
+	var counts string
+	if s.LoadErr != nil {
+		counts = errStyle.Render("(error)")
+	} else if s.Root == nil {
+		counts = dimStyle.Render("(loading…)")
+	} else if mods == 0 && untr == 0 {
+		counts = dimStyle.Render("(clean)")
+	} else {
+		var parts []string
+		if mods > 0 {
+			parts = append(parts, fmt.Sprintf("M:%d", mods))
+		}
+		if untr > 0 {
+			parts = append(parts, fmt.Sprintf("?:%d", untr))
+		}
+		counts = dimStyle.Render("(" + strings.Join(parts, " ") + ")")
+	}
+	tail := ""
+	if !s.Expanded {
+		tail += "  " + dimStyle.Render("[collapsed]")
+	}
+	if s.WT.Locked {
+		tail += "  " + dimStyle.Render("[locked]")
+	}
+	if s.WT.Prunable {
+		tail += "  " + dimStyle.Render("[prunable]")
+	}
+	row := fmt.Sprintf("%s %s  %s%s", chev, dirStyle.Render(name), counts, tail)
+	return m.applyCursor(row, rowIdx == m.cursor)
+}
+
 func (m *Model) renderExpanded(n *tree.Node) string {
 	if n.File != nil && n.File.Binary {
 		return dimStyle.Render("  ⟨binary file⟩")
@@ -1177,7 +1607,7 @@ func (m *Model) renderExpanded(n *tree.Node) string {
 		return dimStyle.Render("  ⟨no diff⟩")
 	}
 	cursor := -1
-	if i := m.cursor; i >= 0 && i < len(m.rows) && m.rows[i] == n {
+	if cur := m.currentTreeNode(); cur == n {
 		cursor = m.diffCursor
 	}
 	return render.Hunks(n.Path, n.Hunks, m.width, cursor)
@@ -1192,9 +1622,9 @@ func (m *Model) renderHelpBody() string {
 		{"Navigation", []row{
 			{"j / ↓", "move cursor down"},
 			{"k / ↑", "move cursor up"},
-			{"h / ←", "collapse (or jump to parent)"},
+			{"h / ←", "collapse (or jump to parent / section)"},
 			{"l / →", "expand"},
-			{"[ / ]", "previous / next folder"},
+			{"[ / ]", "previous / next folder or worktree"},
 			{"g / G", "top / bottom"},
 			{"ctrl+u / ctrl+d", "page up / down"},
 		}},
@@ -1203,6 +1633,9 @@ func (m *Model) renderHelpBody() string {
 			{"b", "file history (commits touching this file)"},
 			{"left-click row", "toggle expand/collapse"},
 			{"scroll wheel", "scroll viewport"},
+		}},
+		{"Worktrees", []row{
+			{"tab / ⇧tab", "next / prev worktree (in log mode)"},
 		}},
 		{"Search", []row{
 			{"/", "open global search"},
@@ -1259,8 +1692,9 @@ func (m *Model) renderHelpBody() string {
 	return out
 }
 
-func zoneID(i int) string       { return fmt.Sprintf("row-%d", i) }
-func commitZoneID(i int) string { return fmt.Sprintf("commit-%d", i) }
+func zoneID(i int) string             { return fmt.Sprintf("row-%d", i) }
+func commitZoneID(i int) string       { return fmt.Sprintf("commit-%d", i) }
+func headerZoneID(sectionIdx int) string { return fmt.Sprintf("wt-%d", sectionIdx) }
 
 func truncate(s string, w int) string {
 	if w <= 0 {

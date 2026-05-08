@@ -10,6 +10,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/andreas-bergstrom/gdui/internal/git"
 	"github.com/andreas-bergstrom/gdui/internal/ui"
 	"github.com/andreas-bergstrom/gdui/internal/watch"
 )
@@ -37,10 +38,15 @@ func main() {
 	m := ui.New(root)
 	prog := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 
-	stop := watch.Start(root, 200*time.Millisecond, func() {
-		prog.Send(ui.RefreshMsg{})
-	})
-	defer stop()
+	// Spawn one file watcher per linked worktree so HEAD-event auto-refresh
+	// works regardless of which worktree was edited. List once at startup —
+	// worktrees added/removed mid-session require restarting gdui.
+	stops := startWatchers(root, prog)
+	defer func() {
+		for _, s := range stops {
+			s()
+		}
+	}()
 
 	if _, err := prog.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "gd:", err)
@@ -54,4 +60,24 @@ func repoRoot() (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+func startWatchers(root string, prog *tea.Program) []func() {
+	wts, err := git.ListWorktrees(root)
+	if err != nil || len(wts) == 0 {
+		// Fall back to watching just the launch worktree.
+		stop := watch.Start(root, 200*time.Millisecond, func() {
+			prog.Send(ui.RefreshMsg{Root: root})
+		})
+		return []func(){stop}
+	}
+	stops := make([]func(), 0, len(wts))
+	for _, wt := range wts {
+		wt := wt
+		stop := watch.Start(wt.Root, 200*time.Millisecond, func() {
+			prog.Send(ui.RefreshMsg{Root: wt.Root})
+		})
+		stops = append(stops, stop)
+	}
+	return stops
 }

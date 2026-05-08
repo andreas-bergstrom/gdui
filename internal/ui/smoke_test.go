@@ -13,8 +13,8 @@ import (
 	"github.com/andreas-bergstrom/gdui/internal/tree"
 )
 
-// drive runs Init + the synchronous status command, then feeds a window-size
-// message to the model and returns its current rendered frame.
+// drive runs Init + the synchronous initial-data command, then feeds a
+// window-size message to the model and returns its current rendered frame.
 func drive(t *testing.T, repo string) (Model, string) {
 	t.Helper()
 	m := New(repo)
@@ -29,6 +29,18 @@ func drive(t *testing.T, repo string) (Model, string) {
 	return mm, mm.View()
 }
 
+// changedNodes returns the *tree.Node entries from the current display rows
+// that correspond to changed files (skipping headers and unchanged nodes).
+func (m Model) treeNodes() []*tree.Node {
+	out := make([]*tree.Node, 0, len(m.rows))
+	for _, r := range m.rows {
+		if t, ok := r.(treeRow); ok && t.node != nil {
+			out = append(out, t.node)
+		}
+	}
+	return out
+}
+
 func TestSmoke_TreeBuiltFromRealRepo(t *testing.T) {
 	repo := os.Getenv("GD_SMOKE_REPO")
 	if repo == "" {
@@ -41,14 +53,15 @@ func TestSmoke_TreeBuiltFromRealRepo(t *testing.T) {
 	if m.err != nil {
 		t.Fatalf("model error: %v", m.err)
 	}
-	if len(m.rows) == 0 {
-		t.Fatalf("expected rows, got none. view:\n%s", view)
+	nodes := m.treeNodes()
+	if len(nodes) == 0 {
+		t.Fatalf("expected tree rows, got none. view:\n%s", view)
 	}
 
 	// Verify per-file +/- counts match `git diff --numstat HEAD`.
 	want := numstat(t, repo)
 	got := map[string][2]int{}
-	for _, n := range m.rows {
+	for _, n := range nodes {
 		if n.IsDir || n.File == nil {
 			continue
 		}
@@ -64,7 +77,7 @@ func TestSmoke_TreeBuiltFromRealRepo(t *testing.T) {
 
 	// Untracked files should appear with Adds > 0.
 	untracked := false
-	for _, n := range m.rows {
+	for _, n := range nodes {
 		if n.File != nil && n.File.Kind == git.Untracked {
 			untracked = true
 			if n.Adds == 0 {
@@ -77,7 +90,7 @@ func TestSmoke_TreeBuiltFromRealRepo(t *testing.T) {
 	}
 
 	// Verify hunk loading works for one tracked file.
-	for _, n := range m.rows {
+	for _, n := range nodes {
 		if n.IsDir || n.File == nil || n.File.Kind == git.Untracked {
 			continue
 		}
@@ -91,8 +104,10 @@ func TestSmoke_TreeBuiltFromRealRepo(t *testing.T) {
 		break
 	}
 
-	// Tree depth consistency: every node's Depth should be derivable.
-	_ = tree.Flatten(m.root)
+	// Tree depth consistency: every section's tree should flatten cleanly.
+	for _, s := range m.sections {
+		_ = tree.Flatten(s.Root)
+	}
 }
 
 func numstat(t *testing.T, repo string) map[string][2]int {

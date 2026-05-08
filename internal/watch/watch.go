@@ -2,6 +2,7 @@ package watch
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -14,6 +15,12 @@ import (
 //
 // Errors during setup are logged-by-omission: if we can't watch, the UI
 // degrades gracefully (manual `r` still works).
+//
+// In linked git worktrees the per-worktree HEAD log lives outside repoRoot
+// (under `<main>/.git/worktrees/<name>/logs/HEAD`), so we resolve its path
+// via `git rev-parse --git-path logs/HEAD`, watch its parent directory, and
+// allow that exact file through `shouldIgnore`. In main worktrees the same
+// resolution lands at `<repoRoot>/.git/logs/HEAD`.
 func Start(repoRoot string, debounce time.Duration, onChange func()) (stop func()) {
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -21,13 +28,13 @@ func Start(repoRoot string, debounce time.Duration, onChange func()) (stop func(
 	}
 
 	addRecursive(w, repoRoot)
-	// Also watch .git/logs (non-recursive) so we catch HEAD updates from
-	// commits, checkouts, resets, etc. fsnotify watches at directory
-	// granularity; shouldIgnore allows the specific HEAD file through.
-	_ = w.Add(filepath.Join(repoRoot, ".git", "logs"))
+	headLogPath := resolveHeadLogPath(repoRoot)
+	if headLogPath != "" {
+		_ = w.Add(filepath.Dir(headLogPath))
+	}
 
 	done := make(chan struct{})
-	go run(w, repoRoot, debounce, onChange, done)
+	go run(w, repoRoot, headLogPath, debounce, onChange, done)
 
 	return func() {
 		close(done)
@@ -35,7 +42,26 @@ func Start(repoRoot string, debounce time.Duration, onChange func()) (stop func(
 	}
 }
 
-func run(w *fsnotify.Watcher, repoRoot string, debounce time.Duration, onChange func(), done chan struct{}) {
+// resolveHeadLogPath asks git for the absolute path to logs/HEAD for the
+// worktree at repoRoot. `git rev-parse --git-path logs/HEAD` returns a
+// relative path for main worktrees and an absolute path for linked ones;
+// we normalize to absolute relative to repoRoot. Returns "" on error.
+func resolveHeadLogPath(repoRoot string) string {
+	out, err := exec.Command("git", "-C", repoRoot, "rev-parse", "--git-path", "logs/HEAD").Output()
+	if err != nil {
+		return ""
+	}
+	p := strings.TrimSpace(string(out))
+	if p == "" {
+		return ""
+	}
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(repoRoot, p)
+	}
+	return filepath.Clean(p)
+}
+
+func run(w *fsnotify.Watcher, repoRoot, headLogPath string, debounce time.Duration, onChange func(), done chan struct{}) {
 	var timer *time.Timer
 	fire := func() {
 		onChange()
@@ -51,7 +77,7 @@ func run(w *fsnotify.Watcher, repoRoot string, debounce time.Duration, onChange 
 			if !ok {
 				return
 			}
-			if shouldIgnore(repoRoot, ev.Name) {
+			if shouldIgnore(repoRoot, ev.Name, headLogPath) {
 				continue
 			}
 			// Newly created directories: start watching them too.
@@ -104,7 +130,13 @@ func addRecursive(w *fsnotify.Watcher, root string) {
 	})
 }
 
-func shouldIgnore(repoRoot, path string) bool {
+func shouldIgnore(repoRoot, path, headLogPath string) bool {
+	// The per-worktree HEAD log is the only path we permit outside repoRoot —
+	// in linked worktrees it lives under <main>/.git/worktrees/<name>/logs/HEAD.
+	cleanPath := filepath.Clean(path)
+	if headLogPath != "" && cleanPath == headLogPath {
+		return false
+	}
 	rel, err := filepath.Rel(repoRoot, path)
 	if err != nil {
 		return true
@@ -112,17 +144,14 @@ func shouldIgnore(repoRoot, path string) bool {
 	if rel == "." {
 		return true
 	}
+	// Outside repoRoot — ignore. The HEAD-log exception above already
+	// admitted the only legitimate outside-the-tree event.
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return true
+	}
 	first := strings.SplitN(rel, string(filepath.Separator), 2)[0]
 	switch first {
-	case ".git":
-		// Allow .git/logs/HEAD through — it's touched by every HEAD-affecting
-		// operation (commit, checkout, reset, merge), giving us a reliable
-		// signal to refresh the log view.
-		if rel == filepath.Join(".git", "logs", "HEAD") {
-			return false
-		}
-		return true
-	case "node_modules", "vendor":
+	case ".git", "node_modules", "vendor":
 		return true
 	}
 	// Editor swap/lock noise.
