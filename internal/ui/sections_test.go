@@ -139,3 +139,32 @@ func TestFlattenCommitTree_NoHeader(t *testing.T) {
 		}
 	}
 }
+
+func TestNeedsRepaintAfterMove(t *testing.T) {
+	h0 := headerRow{sectionIdx: 0}
+	h1 := headerRow{sectionIdx: 1}
+	t0a := treeRow{sectionIdx: 0}
+	t0b := treeRow{sectionIdx: 0}
+	t1a := treeRow{sectionIdx: 1}
+
+	cases := []struct {
+		name string
+		prev displayRow
+		next displayRow
+		want bool
+	}{
+		{"same row", t0a, t0a, false},
+		{"two tree rows in same section", t0a, t0b, false},
+		{"header to tree, same section", h0, t0a, true},
+		{"tree to header, same section", t0a, h0, true},
+		{"tree across sections", t0a, t1a, true},
+		{"header across sections", h0, h1, true},
+		{"nil prev", nil, t0a, false},
+		{"nil next", t0a, nil, false},
+	}
+	for _, c := range cases {
+		if got := needsRepaintAfterMove(c.prev, c.next); got != c.want {
+			t.Errorf("%s: needsRepaintAfterMove = %v, want %v", c.name, got, c.want)
+		}
+	}
+}

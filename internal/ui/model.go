@@ -321,7 +321,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Preserve in-section expand state across reloads.
 		preserveTreeState(s.Root, msg.tree)
-		prevPath := m.cursorPath()
+		prevAnchor := m.cursorAnchor()
 		s.Files = msg.files
 		s.Root = msg.tree
 		s.LoadErr = nil
@@ -334,7 +334,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.err = nil
 		prevDiffCursor := m.diffCursor
 		m.refreshView()
-		m.restoreCursorByPath(prevPath, prevDiffCursor)
+		m.restoreCursor(prevAnchor, prevDiffCursor)
 		return m, m.refreshExpandedHunks()
 
 	case logMsg:
@@ -605,6 +605,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleKeyTree(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	prevRow := m.currentRow()
 	switch {
 	case key.Matches(msg, keys.Blame):
 		n := m.currentTreeNode()
@@ -671,7 +672,44 @@ func (m *Model) handleKeyTree(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 	}
+	// In multi-section views the section header line styles itself differently
+	// from the tree rows around it (full-width bg vs. just a chevron+name).
+	// bubbletea's partial-redraw drops paints on lines whose visible width
+	// matches across frames but whose styled-byte structure differs — leaving
+	// stale cursor highlight from the old position visible alongside the new
+	// one. Force a full repaint when navigation crosses between a header row
+	// and a tree row, or between sections. Same mitigation as toggle's
+	// shrinking case in CLAUDE.md.
+	if m.showSectionHeaders() && needsRepaintAfterMove(prevRow, m.currentRow()) {
+		return *m, tea.ClearScreen
+	}
 	return *m, nil
+}
+
+// needsRepaintAfterMove returns true when a cursor move crosses a row-type
+// boundary in a multi-section view: header↔tree or one section's rows to
+// another section's. Same-section, same-type moves don't trigger the
+// bubbletea redraw glitch, so we don't pay the flicker for them.
+func needsRepaintAfterMove(prev, next displayRow) bool {
+	if prev == nil || next == nil || prev == next {
+		return false
+	}
+	prevSec, prevHeader := rowSectionAndKind(prev)
+	nextSec, nextHeader := rowSectionAndKind(next)
+	if prevSec != nextSec {
+		return true
+	}
+	return prevHeader != nextHeader
+}
+
+func rowSectionAndKind(r displayRow) (sectionIdx int, isHeader bool) {
+	switch row := r.(type) {
+	case headerRow:
+		return row.sectionIdx, true
+	case treeRow:
+		return row.sectionIdx, false
+	}
+	return -1, false
 }
 
 // moveDown advances one step. If the cursor is on an expanded file with diff
@@ -969,24 +1007,75 @@ func (m *Model) activeRoot() string {
 	return m.repoRoot
 }
 
-func (m *Model) cursorPath() string {
-	if n := m.currentTreeNode(); n != nil {
-		return n.Path
-	}
-	return ""
+// cursorAnchor captures enough about the cursor's current position to find
+// it again after the row list is rebuilt. sectionRoot identifies the
+// worktree section (so same-named files in different sections don't
+// collide); treePath identifies a specific node when the cursor is on a
+// tree row, or is empty when the cursor is on a section header.
+type cursorAnchor struct {
+	sectionRoot string
+	treePath    string
 }
 
-func (m *Model) restoreCursorByPath(path string, prevDiffCursor int) {
+func (m *Model) cursorAnchor() cursorAnchor {
+	switch r := m.currentRow().(type) {
+	case treeRow:
+		if r.node == nil {
+			return cursorAnchor{}
+		}
+		root := ""
+		if r.sectionIdx >= 0 && r.sectionIdx < len(m.sections) {
+			root = m.sections[r.sectionIdx].WT.Root
+		}
+		return cursorAnchor{sectionRoot: root, treePath: r.node.Path}
+	case headerRow:
+		if r.sectionIdx >= 0 && r.sectionIdx < len(m.sections) {
+			return cursorAnchor{sectionRoot: m.sections[r.sectionIdx].WT.Root}
+		}
+	}
+	return cursorAnchor{}
+}
+
+// restoreCursor relocates the cursor after a row rebuild. It prefers the
+// exact (sectionRoot, treePath) tuple, falls back to that section's header
+// if the file vanished, and only as a last resort drops to row 0. Without
+// the section-root fallback, a refresh that arrives while the cursor is on
+// a section header would reset cursor to 0 — visually "jumping to top"
+// whenever the user navigates between sections during background activity.
+func (m *Model) restoreCursor(a cursorAnchor, prevDiffCursor int) {
 	m.cursor = 0
 	m.diffCursor = -1
-	if path == "" {
+	if a.sectionRoot == "" && a.treePath == "" {
+		return
+	}
+	if a.treePath != "" {
+		for i, r := range m.rows {
+			t, ok := r.(treeRow)
+			if !ok || t.node == nil || t.node.Path != a.treePath {
+				continue
+			}
+			if a.sectionRoot != "" {
+				if t.sectionIdx < 0 || t.sectionIdx >= len(m.sections) ||
+					m.sections[t.sectionIdx].WT.Root != a.sectionRoot {
+					continue
+				}
+			}
+			m.cursor = i
+			m.diffCursor = prevDiffCursor
+			return
+		}
+	}
+	if a.sectionRoot == "" {
 		return
 	}
 	for i, r := range m.rows {
-		if t, ok := r.(treeRow); ok && t.node != nil && t.node.Path == path {
+		h, ok := r.(headerRow)
+		if !ok || h.sectionIdx < 0 || h.sectionIdx >= len(m.sections) {
+			continue
+		}
+		if m.sections[h.sectionIdx].WT.Root == a.sectionRoot {
 			m.cursor = i
-			m.diffCursor = prevDiffCursor
-			break
+			return
 		}
 	}
 }
