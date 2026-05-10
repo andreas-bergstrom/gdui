@@ -107,6 +107,11 @@ type Model struct {
 	initialized bool
 
 	search searchState
+
+	// filter holds the active tree-filter state. Lives globally on the
+	// model: tree modes consult it; non-tree modes simply don't, so the
+	// filter survives a quick `b → esc` round-trip into ModeFileLog and back.
+	filter filterState
 }
 
 func New(repoRoot string) Model {
@@ -576,6 +581,19 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleKeySearch(msg)
 	}
 
+	// Filter-editing gate: while typing in the filter input, swallow keys
+	// other than Ctrl+C (still quits) so global bindings like `q` and `r`
+	// don't fire mid-pattern. Same shape as the ModeSearch gate above —
+	// the two are mutually exclusive (ModeSearch never coexists with
+	// filter editing because entering search uses a separate mode and `f`
+	// is dispatched via handleKeyTree).
+	if m.filter.editing {
+		if msg.Type == tea.KeyCtrlC {
+			return m, tea.Quit
+		}
+		return m.handleKeyFilter(msg)
+	}
+
 	switch {
 	case key.Matches(msg, keys.Quit):
 		return m, tea.Quit
@@ -607,6 +625,8 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *Model) handleKeyTree(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	prevRow := m.currentRow()
 	switch {
+	case key.Matches(msg, keys.Filter):
+		return *m, m.enterFilterEdit()
 	case key.Matches(msg, keys.Blame):
 		n := m.currentTreeNode()
 		if n == nil || n.IsDir || n.File == nil {
@@ -1236,7 +1256,11 @@ func (m *Model) recomputeViewportHeight() {
 	}
 	headerH := lipgloss.Height(m.header())
 	footerH := lipgloss.Height(m.footer())
-	vpH := m.height - headerH - footerH
+	statusH := 0
+	if m.filter.visible() {
+		statusH = 1
+	}
+	vpH := m.height - headerH - footerH - statusH
 	if vpH < 1 {
 		vpH = 1
 	}
@@ -1287,12 +1311,16 @@ func (m *Model) refreshView() {
 }
 
 // flattenForView produces the row list for the current tree-mode view —
-// either commit tree or working-tree sections.
+// either commit tree or working-tree sections. Routes through the filter-
+// aware helpers when m.filter has a compiled matcher; otherwise the
+// matcher==nil branch in those helpers delegates back to the unfiltered
+// path so non-filter renders are byte-identical to the historical UI.
 func (m *Model) flattenForView() []displayRow {
+	matcher := m.filter.matcher
 	if m.mode == ModeCommit {
-		return flattenCommitTree(m.commitTree)
+		return flattenCommitTreeFiltered(m.commitTree, matcher)
 	}
-	return flattenSections(m.sections, m.showSectionHeaders())
+	return flattenSectionsFiltered(m.sections, m.showSectionHeaders(), matcher)
 }
 
 // showSectionHeaders is true when the UI should render collapsible headers
@@ -1379,7 +1407,12 @@ func (m Model) View() string {
 	} else {
 		body = m.vp.View()
 	}
-	return m.zones.Scan(lipgloss.JoinVertical(lipgloss.Left, header, body, footer))
+	parts := []string{header, body}
+	if m.filter.visible() && !m.showHelp {
+		parts = append(parts, m.fitWidth(m.renderFilterStatus()))
+	}
+	parts = append(parts, footer)
+	return m.zones.Scan(lipgloss.JoinVertical(lipgloss.Left, parts...))
 }
 
 func (m Model) header() string {
@@ -1726,12 +1759,12 @@ func (m *Model) renderHelpBody() string {
 		{"Worktrees", []row{
 			{"tab / ⇧tab", "next / prev worktree (in log mode)"},
 		}},
-		{"Search", []row{
-			{"/", "open global search"},
-			{"*.go", "glob query — match filenames only"},
-			{"enter", "(in search) copy path or path:line"},
-			{"ctrl+u", "(in search) clear query"},
-			{"esc", "(in search) close"},
+		{"Search & filter", []row{
+			{"/", "open global search (paths + contents)"},
+			{"f", "filter tree — substring · *glob · re:regex"},
+			{"enter", "(in search) copy path; (in filter) commit query"},
+			{"ctrl+u", "(in search/filter) clear query"},
+			{"esc", "(in search) close; (in filter) clear and exit"},
 		}},
 		{"Modes", []row{
 			{"a", "cycle view: changed → all → log"},

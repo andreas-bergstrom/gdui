@@ -9,6 +9,7 @@ A focused terminal UI for browsing your working-tree git diff as a sparse, colla
 - **Sparse tree** — only changed paths appear; single-child directory chains are collapsed (`src/foo/bar/`).
 - **Inline expansion** — press <kbd>enter</kbd> on a file to reveal the syntax-highlighted unified diff under the row, no pager handoff.
 - **Three view modes** — cycle with <kbd>a</kbd> between *changed only*, *all tracked files*, and *commit log*; pick a commit to drill into its file tree.
+- **Tree filter** — press <kbd>f</kbd> to narrow the tree by substring, glob (`*.go`), or full regex (`re:^cmd/`); applies across every linked worktree at once.
 - **Live updates** — fsnotify-backed file watcher refreshes the tree on disk changes (200 ms debounce), and refreshes the log view when a new commit lands. Useful when an agent is editing files or committing in another pane.
 - **Keyboard + mouse** — vim-style navigation; click rows to toggle, scroll-wheel to scroll.
 - **Status-aware markers** — `M` modified, `A` added, `D` deleted, `R` renamed, `?` untracked.
@@ -100,6 +101,8 @@ The binary is named `gdui` rather than `gd` because `gd` is a common alias for `
 | `ctrl+u` / `ctrl+d`          | page up / down                        |
 | `a`                          | cycle view: changed → all → log       |
 | `b`                          | file history (on a file row)          |
+| `/`                          | open full-text search                 |
+| `f`                          | filter tree (substring / glob / `re:` regex) |
 | `esc` / `backspace`          | back out of a commit, or out of file history |
 | `r`                          | refresh manually                      |
 | `?`                          | toggle help                           |
@@ -116,6 +119,21 @@ Press <kbd>a</kbd> to cycle:
 3. **Log** — the last 100 commits on the current branch. Select one with <kbd>enter</kbd> to open its file tree (commit vs parent; root and merge commits handled). <kbd>esc</kbd> / <kbd>backspace</kbd> returns to the log.
 
 From *changed* or *all*, press <kbd>b</kbd> on any file row to open a **file history** view — the commits that touched that file (renames followed via `git log --follow`). <kbd>enter</kbd> drills into a commit; <kbd>esc</kbd> returns to the file history, then again to the tree.
+
+### Filtering the tree
+
+Press <kbd>f</kbd> in any tree view to open a one-line filter prompt at the bottom of the pane. The filter applies to **every worktree** simultaneously and matches against the **full repo-relative path**. Directories whose subtree contains a match are auto-revealed even if collapsed.
+
+| Pattern            | Behavior                                                                  |
+|--------------------|---------------------------------------------------------------------------|
+| `status`           | Substring match. Smart-case: lowercase → case-insensitive.                |
+| `STATUS`           | Any uppercase letter switches to case-sensitive matching.                 |
+| `*.go`             | Glob — `*` matches within a path segment, `?` matches one non-slash char. |
+| `**/foo.go`        | `**` crosses path separators.                                             |
+| `[!a-z]*.md`       | POSIX-style glob negation.                                                |
+| `re:^cmd/.*\.go`   | `re:` prefix → full Go regex (anchors and groups available).              |
+
+<kbd>enter</kbd> commits the filter, <kbd>esc</kbd> clears it. Press <kbd>f</kbd> again to refine the existing query. The filter persists across mode cycling (<kbd>a</kbd>) and file-watcher refreshes; non-tree views just ignore it.
 
 ## What it shows
 

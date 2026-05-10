@@ -11,6 +11,7 @@ type keymap struct {
 	Back                              key.Binding
 	Blame                             key.Binding
 	Search                            key.Binding
+	Filter                            key.Binding
 	NextWorktree, PrevWorktree        key.Binding
 }
 
@@ -33,6 +34,7 @@ var keys = keymap{
 	Back:         key.NewBinding(key.WithKeys("esc", "backspace"), key.WithHelp("esc", "back")),
 	Blame:        key.NewBinding(key.WithKeys("b"), key.WithHelp("b", "file history")),
 	Search:       key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "search")),
+	Filter:       key.NewBinding(key.WithKeys("f"), key.WithHelp("f", "filter tree")),
 	NextWorktree: key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "next worktree (log)")),
 	PrevWorktree: key.NewBinding(key.WithKeys("shift+tab"), key.WithHelp("⇧tab", "prev worktree (log)")),
 }
