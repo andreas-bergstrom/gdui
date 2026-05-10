@@ -8,9 +8,12 @@ A focused terminal UI for browsing your working-tree git diff as a sparse, colla
 
 - **Sparse tree** — only changed paths appear; single-child directory chains are collapsed (`src/foo/bar/`).
 - **Inline expansion** — press <kbd>enter</kbd> on a file to reveal the syntax-highlighted unified diff under the row, no pager handoff.
-- **Three view modes** — cycle with <kbd>a</kbd> between *changed only*, *all tracked files*, and *commit log*; pick a commit to drill into its file tree.
-- **Tree filter** — press <kbd>f</kbd> to narrow the tree by substring, glob (`*.go`), or full regex (`re:^cmd/`); applies across every linked worktree at once.
+- **Multi-worktree split sidebar** — every linked git worktree of the same repo gets its own collapsible section in one pane, so feature-branch worktrees and the main checkout are side-by-side without juggling terminals.
 - **Live updates** — fsnotify-backed file watcher refreshes the tree on disk changes (200 ms debounce), and refreshes the log view when a new commit lands. Useful when an agent is editing files or committing in another pane.
+- **Three view modes** — cycle with <kbd>a</kbd> between *changed only*, *all tracked files*, and *commit log*; pick a commit to drill into its file tree.
+- **Per-file history** — press <kbd>b</kbd> on any file to list every commit that touched it (renames followed via `git log --follow`); <kbd>enter</kbd> drills into a commit's diff.
+- **Tree filter** — press <kbd>f</kbd> to narrow the tree by substring, glob (`*.go`), or full regex (`re:^cmd/`); applies across every linked worktree at once.
+- **Full-text search** — press <kbd>/</kbd> to fuzzy-search file paths and contents across the repo; <kbd>enter</kbd> copies the result to the clipboard for hand-off to your editor or agent.
 - **Keyboard + mouse** — vim-style navigation; click rows to toggle, scroll-wheel to scroll.
 - **Status-aware markers** — `M` modified, `A` added, `D` deleted, `R` renamed, `?` untracked.
 - **Single static binary** — shells out to the `git` CLI; no library needed.
@@ -103,6 +106,7 @@ The binary is named `gdui` rather than `gd` because `gd` is a common alias for `
 | `b`                          | file history (on a file row)          |
 | `/`                          | open full-text search                 |
 | `f`                          | filter tree (substring / glob / `re:` regex) |
+| `tab` / `⇧tab`               | cycle active worktree (in log / file-history mode) |
 | `esc` / `backspace`          | back out of a commit, or out of file history |
 | `r`                          | refresh manually                      |
 | `?`                          | toggle help                           |
@@ -119,6 +123,12 @@ Press <kbd>a</kbd> to cycle:
 3. **Log** — the last 100 commits on the current branch. Select one with <kbd>enter</kbd> to open its file tree (commit vs parent; root and merge commits handled). <kbd>esc</kbd> / <kbd>backspace</kbd> returns to the log.
 
 From *changed* or *all*, press <kbd>b</kbd> on any file row to open a **file history** view — the commits that touched that file (renames followed via `git log --follow`). <kbd>enter</kbd> drills into a commit; <kbd>esc</kbd> returns to the file history, then again to the tree.
+
+### Multi-worktree
+
+If the repo has linked worktrees (`git worktree add …`), each one renders as its own collapsible section in the same pane, ordered by `git worktree list`. The launch directory's worktree is the initial *active* one — it determines which section the cursor opens on, and which worktree's data is shown in the log / commit / file-history modes. Use <kbd>tab</kbd> / <kbd>⇧tab</kbd> there to cycle the active worktree without leaving the mode.
+
+The file watcher runs once per worktree, so a save in any of them refreshes only the affected section. The tree filter (<kbd>f</kbd>) applies across all sections simultaneously, so you can spot a file by name regardless of which worktree it lives in.
 
 ### Filtering the tree
 
