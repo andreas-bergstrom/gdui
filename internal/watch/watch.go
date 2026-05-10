@@ -158,6 +158,7 @@ func shouldIgnore(repoRoot, path, headLogPath string) bool {
 	base := filepath.Base(path)
 	switch {
 	case strings.HasPrefix(base, ".#"),
+		strings.HasPrefix(base, ".gdui-drop-"),
 		strings.HasSuffix(base, "~"),
 		strings.HasSuffix(base, ".swp"),
 		strings.HasSuffix(base, ".swo"),

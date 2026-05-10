@@ -36,6 +36,10 @@ func main() {
 	}
 
 	m := ui.New(root)
+	// Bracketed paste is on by default in Bubble Tea v1.3+; the drag-drop
+	// import flow in internal/ui/drop.go relies on it (paste arrives as a
+	// KeyMsg with msg.Paste == true). Don't add tea.WithoutBracketedPaste()
+	// without removing the drop handler first.
 	prog := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 
 	// Spawn one file watcher per linked worktree so HEAD-event auto-refresh

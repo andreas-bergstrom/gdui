@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	zone "github.com/lrstanley/bubblezone"
 
+	"github.com/andreas-bergstrom/gdui/internal/drop"
 	"github.com/andreas-bergstrom/gdui/internal/git"
 	"github.com/andreas-bergstrom/gdui/internal/render"
 	"github.com/andreas-bergstrom/gdui/internal/tree"
@@ -112,6 +114,18 @@ type Model struct {
 	// model: tree modes consult it; non-tree modes simply don't, so the
 	// filter survives a quick `b → esc` round-trip into ModeFileLog and back.
 	filter filterState
+
+	// drop holds the drag-and-drop import state. While the prompt is up,
+	// handleKey routes to handleKeyDrop. Cleared on mode transitions out
+	// of tree modes — see dropResetOnModeChange.
+	drop dropState
+
+	// pendingDropTarget tells the next statusMsg handler where to place the
+	// cursor instead of restoring the pre-refresh position. Set in the
+	// dropCompletedMsg handler, consumed (and cleared) by statusMsg. Without
+	// this, the cursor would snap back to the file the user was looking at
+	// before the drop, not to the newly-imported file.
+	pendingDropTarget cursorAnchor
 }
 
 func New(repoRoot string) Model {
@@ -327,6 +341,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Preserve in-section expand state across reloads.
 		preserveTreeState(s.Root, msg.tree)
 		prevAnchor := m.cursorAnchor()
+		// A drop just finished: target the new file instead of restoring
+		// the pre-refresh cursor. Pre-expanding ancestors here ensures the
+		// row is actually flattened into view.
+		if m.pendingDropTarget.sectionRoot == s.WT.Root && m.pendingDropTarget.treePath != "" {
+			prevAnchor = m.pendingDropTarget
+			expandToPath(msg.tree, m.pendingDropTarget.treePath)
+			m.pendingDropTarget = cursorAnchor{}
+		}
 		s.Files = msg.files
 		s.Root = msg.tree
 		s.LoadErr = nil
@@ -451,6 +473,42 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case dropCompletedMsg:
+		root := msg.root
+		relPath, err := filepath.Rel(root, msg.dest)
+		if err != nil || relPath == "." || strings.HasPrefix(relPath, "..") {
+			// dest fell outside root somehow; nothing to anchor to.
+			return m, m.advanceDropQueue()
+		}
+		// Tree paths use forward slashes regardless of OS — normalize.
+		relPath = filepath.ToSlash(relPath)
+		// Mark the in-flight drop's destination so the next statusMsg lands
+		// the cursor there. expandToPath is also called on the current
+		// section root so the directory chain is open BEFORE the reload; the
+		// per-Path Expanded carries over via preserveTreeState.
+		m.pendingDropTarget = cursorAnchor{sectionRoot: root, treePath: relPath}
+		if idx := findSectionByRoot(m.sections, root); idx >= 0 {
+			m.activeWT = idx
+			if m.sections[idx].Root != nil {
+				expandToPath(m.sections[idx].Root, relPath)
+			}
+		}
+		// Advance the queue first (may prompt for the next drop), then
+		// reload the destination section's status.
+		advance := m.advanceDropQueue()
+		reload := loadStatusCmd(root, m.mode == ModeAll)
+		return m, tea.Batch(advance, reload)
+
+	case dropFailedMsg:
+		// Pop the failed drop off the queue (queue[0] was the one being
+		// copied) and surface the error in the status row. Subsequent
+		// queued drops still get their own prompt.
+		if len(m.drop.queue) > 0 {
+			m.drop.queue = m.drop.queue[1:]
+		}
+		m.drop.err = msg.err.Error()
+		return m, m.advanceDropQueue()
+
 	case tea.MouseMsg:
 		return m.handleMouse(msg)
 
@@ -570,6 +628,56 @@ func (m *Model) refreshExpandedHunks() tea.Cmd {
 // --- key handling ---
 
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Drop detection: bracketed paste (Terminal.app, iTerm2, kitty, etc.)
+	// arrives as a KeyMsg with msg.Paste=true. Terminals that DON'T support
+	// bracketed paste (notably Warp) just type the dropped path as plain
+	// rune input — Bubble Tea batches consecutive printable runes into one
+	// KeyMsg, so a multi-rune KeyRunes with Paste=false is our fallback
+	// signal. We require ≥4 runes to avoid mistaking fast typing for a drop;
+	// drop.Parse's strict stat check filters out anything that isn't a real
+	// file. The remaining false-positive is the user pasting plain text that
+	// is exactly a valid file path with no other content — recoverable via
+	// Esc on the resulting prompt.
+	const dropMinRunes = 4
+	maybeDrop := msg.Paste || (msg.Type == tea.KeyRunes && len(msg.Runes) >= dropMinRunes)
+	if maybeDrop && (m.mode == ModeChanged || m.mode == ModeAll) {
+		payload := string(msg.Runes)
+		if paths := drop.Parse(payload); len(paths) > 0 {
+			return *m, m.handleDropPaste(paths)
+		}
+		// Drop didn't parse but the burst LOOKS like the start of an
+		// absolute path whose parent directory exists. Most likely
+		// explanation: a Warp-style drop with a space in the filename —
+		// Bubble Tea's input parser breaks rune batches on spaces, so we
+		// only ever saw the first chunk. Surface a one-shot error in the
+		// drop status row so the user understands why nothing happened.
+		// Esc clears the error (handled below when drop is idle).
+		if !msg.Paste && looksLikeTruncatedDropPath(payload) {
+			m.drop.err = "path likely contains a space — needs bracketed paste (Terminal.app, iTerm2, kitty)"
+			m.refreshView()
+			return *m, tea.ClearScreen
+		}
+	}
+
+	// Esc dismisses a sticky drop error when there's no active prompt.
+	// Without this the warning persists indefinitely once shown.
+	if msg.Type == tea.KeyEsc && m.drop.phase == dropIdle && m.drop.err != "" {
+		m.drop.err = ""
+		m.refreshView()
+		return *m, tea.ClearScreen
+	}
+
+	// Drop-prompt input gate: while the destination/overwrite prompt is up,
+	// swallow keys other than Ctrl+C so global bindings (q, r, a, etc.)
+	// don't fire mid-prompt. Above filter/search gates so an accidental
+	// drop while one of those is open still routes to drop.
+	if m.drop.active() {
+		if msg.Type == tea.KeyCtrlC {
+			return m, tea.Quit
+		}
+		return m.handleKeyDrop(msg)
+	}
+
 	if m.mode == ModeSearch {
 		if msg.Type == tea.KeyCtrlC {
 			return m, tea.Quit
@@ -848,6 +956,7 @@ func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 
 func (m *Model) cycleMode() tea.Cmd {
 	m.vp.SetYOffset(0)
+	m.dropResetOnModeChange()
 	switch m.mode {
 	case ModeChanged:
 		m.mode = ModeAll
@@ -910,6 +1019,7 @@ func (m *Model) openCommit() tea.Cmd {
 	if m.commitCursor < 0 || m.commitCursor >= len(m.commits) {
 		return nil
 	}
+	m.dropResetOnModeChange()
 	c := m.commits[m.commitCursor]
 	m.commitParent = m.mode
 	m.mode = ModeCommit
@@ -938,6 +1048,7 @@ func (m *Model) exitCommit() tea.Cmd {
 }
 
 func (m *Model) openFileLog(root, path string) tea.Cmd {
+	m.dropResetOnModeChange()
 	m.prevTreeMode = m.mode
 	m.mode = ModeFileLog
 	m.fileLogPath = path
@@ -1256,11 +1367,15 @@ func (m *Model) recomputeViewportHeight() {
 	}
 	headerH := lipgloss.Height(m.header())
 	footerH := lipgloss.Height(m.footer())
-	statusH := 0
+	filterH := 0
 	if m.filter.visible() {
-		statusH = 1
+		filterH = 1
 	}
-	vpH := m.height - headerH - footerH - statusH
+	dropH := 0
+	if m.drop.visible() {
+		dropH = 1
+	}
+	vpH := m.height - headerH - footerH - filterH - dropH
 	if vpH < 1 {
 		vpH = 1
 	}
@@ -1410,6 +1525,9 @@ func (m Model) View() string {
 	parts := []string{header, body}
 	if m.filter.visible() && !m.showHelp {
 		parts = append(parts, m.fitWidth(m.renderFilterStatus()))
+	}
+	if m.drop.visible() && !m.showHelp {
+		parts = append(parts, m.fitWidth(m.renderDropStatus()))
 	}
 	parts = append(parts, footer)
 	return m.zones.Scan(lipgloss.JoinVertical(lipgloss.Left, parts...))
@@ -1769,6 +1887,11 @@ func (m *Model) renderHelpBody() string {
 		{"Modes", []row{
 			{"a", "cycle view: changed → all → log"},
 			{"esc / backspace", "back out of commit or file history"},
+		}},
+		{"Drag & drop", []row{
+			{"drop file", "import into repo with destination prompt"},
+			{"enter", "(in drop) copy; on overwrite prompt = yes"},
+			{"esc", "(in drop) skip this file; on overwrite prompt = edit"},
 		}},
 		{"Misc", []row{
 			{"r", "refresh manually"},

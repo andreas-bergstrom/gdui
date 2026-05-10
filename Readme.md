@@ -13,6 +13,7 @@ A focused terminal UI for browsing your working-tree git diff as a sparse, colla
 - **Three view modes** — cycle with <kbd>a</kbd> between *changed only*, *all tracked files*, and *commit log*; pick a commit to drill into its file tree.
 - **Per-file history** — press <kbd>b</kbd> on any file to list every commit that touched it (renames followed via `git log --follow`); <kbd>enter</kbd> drills into a commit's diff.
 - **Tree filter** — press <kbd>f</kbd> to narrow the tree by substring, glob (`*.go`), or full regex (`re:^cmd/`); applies across every linked worktree at once.
+- **Drag-and-drop import** — drop files from Finder/Files/Explorer onto the window; a one-line prompt lets you pick the destination inside the repo, then copies atomically. Cursor lands on the new file once the tree reloads.
 - **Full-text search** — press <kbd>/</kbd> to fuzzy-search file paths and contents across the repo; <kbd>enter</kbd> copies the result to the clipboard for hand-off to your editor or agent.
 - **Keyboard + mouse** — vim-style navigation; click rows to toggle, scroll-wheel to scroll.
 - **Status-aware markers** — `M` modified, `A` added, `D` deleted, `R` renamed, `?` untracked.
@@ -144,6 +145,14 @@ Press <kbd>f</kbd> in any tree view to open a one-line filter prompt at the bott
 | `re:^cmd/.*\.go`   | `re:` prefix → full Go regex (anchors and groups available).              |
 
 <kbd>enter</kbd> commits the filter, <kbd>esc</kbd> clears it. Press <kbd>f</kbd> again to refine the existing query. The filter persists across mode cycling (<kbd>a</kbd>) and file-watcher refreshes; non-tree views just ignore it.
+
+### Drag-and-drop import
+
+Drag a file from your file manager onto the gdui window. A prompt appears at the bottom showing the source and a default destination (`<active-worktree>/<filename>`). Edit the destination with regular typing / <kbd>backspace</kbd> / <kbd>ctrl+u</kbd>, then <kbd>enter</kbd> to copy. If the destination already exists, you get a `(y/n)` confirmation — <kbd>y</kbd> / <kbd>Y</kbd> / <kbd>enter</kbd> overwrites, <kbd>n</kbd> / <kbd>N</kbd> / <kbd>esc</kbd> returns to editing the path. Multi-file drops queue up and prompt one at a time. <kbd>esc</kbd> on the destination prompt skips the current file and advances.
+
+Copies are atomic (temp file in the destination directory + `os.Rename`) so the file watcher never surfaces a partial write. The cursor lands on the new file once the tree reloads.
+
+**Terminal compatibility**: works in any terminal that enables bracketed paste — Terminal.app, iTerm2, kitty, alacritty, WezTerm, GNOME Terminal, Windows Terminal. Warp doesn't enable bracketed paste by default, so drops there work only for filenames without spaces; paths with spaces show a helpful error in the status row pointing you at a compatible terminal.
 
 ## What it shows
 

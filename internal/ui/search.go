@@ -100,6 +100,7 @@ func (m *Model) enterSearch() tea.Cmd {
 	if m.mode == ModeSearch {
 		return nil
 	}
+	m.dropResetOnModeChange()
 	m.search.prevMode = m.mode
 	m.mode = ModeSearch
 	m.search.cursor = 0
