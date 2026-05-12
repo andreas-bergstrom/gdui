@@ -1,6 +1,14 @@
 package git
 
-import "testing"
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"testing"
+)
+
+func zeroPad(i int) string { return fmt.Sprintf("%02d", i) }
 
 func TestParseLog_Empty(t *testing.T) {
 	if got := parseLog(nil); got != nil {
@@ -74,6 +82,71 @@ func TestKindFromStatusLetter(t *testing.T) {
 		if got := kindFromStatusLetter(letter); got != want {
 			t.Errorf("kindFromStatusLetter(%c) = %v, want %v", letter, got, want)
 		}
+	}
+}
+
+func TestLog_SkipReturnsOlderCommits(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git not in PATH: %v", err)
+	}
+	root := resolveTempRoot(t)
+	repo := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	env := append(os.Environ(),
+		"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com",
+		"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com",
+	)
+	mustRun := func(args ...string) {
+		cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+		cmd.Env = env
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	mustRun("init", "-q", "-b", "main")
+	// 15 commits, each with subject c01..c15 (oldest c01, newest c15).
+	for i := 1; i <= 15; i++ {
+		name := "c" + zeroPad(i)
+		if err := os.WriteFile(filepath.Join(repo, name), []byte(name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		mustRun("add", name)
+		mustRun("commit", "-q", "-m", name)
+	}
+
+	// Page 1: 10 newest. Expect c15 first, c06 last.
+	page1, err := Log(repo, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page1) != 10 {
+		t.Fatalf("page1: got %d commits, want 10", len(page1))
+	}
+	if page1[0].Subject != "c15" || page1[9].Subject != "c06" {
+		t.Errorf("page1 boundary: first=%q last=%q (want c15 / c06)", page1[0].Subject, page1[9].Subject)
+	}
+
+	// Page 2 with skip=10: 5 oldest. Expect c05 first, c01 last.
+	page2, err := Log(repo, 10, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page2) != 5 {
+		t.Fatalf("page2: got %d commits, want 5", len(page2))
+	}
+	if page2[0].Subject != "c05" || page2[4].Subject != "c01" {
+		t.Errorf("page2 boundary: first=%q last=%q (want c05 / c01)", page2[0].Subject, page2[4].Subject)
+	}
+
+	// Skip past everything: empty result, no error.
+	none, err := Log(repo, 10, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(none) != 0 {
+		t.Errorf("skip=100 should return empty, got %d", len(none))
 	}
 }
 

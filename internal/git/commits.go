@@ -16,15 +16,25 @@ type Commit struct {
 	Subject  string
 }
 
-// Log returns up to `limit` most recent commits on the current branch.
-func Log(repoRoot string, limit int) ([]Commit, error) {
-	cmd := exec.Command("git", "-C", repoRoot,
+// Log returns up to `limit` commits on the current branch starting at offset
+// `skip` from the newest. skip<=0 means "no offset" (page 1). Used to paginate
+// the multi-section log view: each section asks for one page at a time and
+// keeps appending as the user scrolls.
+//
+// Note: --skip combined with concurrent commits may briefly skip or duplicate
+// commits at the page boundary. The UI bumps a per-section reload generation
+// on file-watcher events to recover.
+func Log(repoRoot string, limit, skip int) ([]Commit, error) {
+	args := []string{"-C", repoRoot,
 		"log",
 		"-n", strconv.Itoa(limit),
 		"--pretty=format:%H%x1f%h%x1f%an%x1f%ad%x1f%s",
 		"--date=short",
-	)
-	out, err := cmd.Output()
+	}
+	if skip > 0 {
+		args = append(args, "--skip", strconv.Itoa(skip))
+	}
+	out, err := exec.Command("git", args...).Output()
 	if err != nil {
 		return nil, fmt.Errorf("git log: %w", err)
 	}

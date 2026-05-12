@@ -37,6 +37,22 @@ type WorktreeSection struct {
 	// auto-expand sections that have changes the first time we see them
 	// without overriding subsequent user-driven collapses.
 	firstLoadDone bool
+
+	// Per-section commit-log state. Populated by ModeLog's lazy paged
+	// loader (loadLogCmd + reloadSectionLog). Independent of Files/Root
+	// above so collapse state and tree state are not entangled with log
+	// state.
+	//
+	// LogCommits is newest-first (matches `git log`); pages are appended
+	// as the user scrolls. LogReloadGen is incremented on every reset
+	// (manual refresh, watcher commit) so stale in-flight pages from a
+	// superseded generation are silently dropped — closes the
+	// pagination-during-refresh race.
+	LogCommits    []git.Commit
+	LogLoaded     bool
+	LogLoading    bool
+	LogHasMore    bool
+	LogReloadGen  int
 }
 
 // displayRow is a row in the unified row list rendered by Model.View.
@@ -49,7 +65,10 @@ type treeRow struct {
 	sectionIdx int // -1 for ModeCommit (commit-tree rows belong to the active selection, not a section)
 	node       *tree.Node
 }
-type commitRow struct{ idx int }
+type commitRow struct {
+	sectionIdx int // -1 when no section context (e.g. flat ModeFileLog)
+	idx        int // index into the owning section's LogCommits
+}
 
 func (headerRow) isDisplayRow() {}
 func (treeRow) isDisplayRow()   {}
@@ -73,6 +92,31 @@ func flattenSections(secs []*WorktreeSection, showHeaders bool) []displayRow {
 		}
 		for _, n := range tree.Flatten(s.Root) {
 			out = append(out, treeRow{sectionIdx: i, node: n})
+		}
+	}
+	return out
+}
+
+// flattenSectionsLogs produces the display row list for ModeLog. Mirrors
+// flattenSections but emits commitRow entries from each section's
+// LogCommits rather than tree nodes. When showHeaders is false (single-
+// section repo), only commit rows are emitted — byte-identical to the
+// pre-multi-section single-pane log layout.
+//
+// Collapsed sections contribute only their header (no commits) so users
+// can lazily expand the ones they care about; the load itself is kicked
+// elsewhere when the header is expanded.
+func flattenSectionsLogs(secs []*WorktreeSection, showHeaders bool) []displayRow {
+	out := []displayRow{}
+	for i, s := range secs {
+		if showHeaders {
+			out = append(out, headerRow{sectionIdx: i})
+			if !s.Expanded {
+				continue
+			}
+		}
+		for j := range s.LogCommits {
+			out = append(out, commitRow{sectionIdx: i, idx: j})
 		}
 	}
 	return out

@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,7 +20,16 @@ import (
 )
 
 const (
+	// logLimit caps the size of ModeFileLog's flat history list.
 	logLimit = 100
+	// logPageSize is the per-section batch size for ModeLog's paged loader.
+	// Small enough that the initial render fits on one screen for typical
+	// repos; auto-load-more fetches the next batch as the cursor approaches
+	// the bottom.
+	logPageSize = 10
+	// autoLoadMoreThreshold is how close the cursor can get to the end of a
+	// section's loaded commits before we proactively fetch the next page.
+	autoLoadMoreThreshold = 3
 	// scrollOff keeps a margin of context lines around the cursor when
 	// auto-scrolling, so the user can see what they're navigating toward
 	// instead of the cursor sitting flush against the screen edge.
@@ -186,10 +196,30 @@ type statusMsg struct {
 }
 
 type logMsg struct {
-	root    string
+	root string
+	// skip is the offset this batch was loaded from. skip==0 means "page 1
+	// — replace the section's LogCommits"; skip>0 means "append starting
+	// at this offset". On mismatch (skip != len(section.LogCommits) for
+	// appends, or stale gen) the message is dropped to defend against
+	// races between auto-load-more and watcher-driven first-page reloads.
+	skip    int
+	gen     int
 	commits []git.Commit
-	err     error
+	// dest distinguishes a multi-section ModeLog batch (DestSectionLog)
+	// from a single-section ModeFileLog batch (DestFileLog). The handlers
+	// have very different routing rules (per-section state on the section
+	// vs. the model-level fileLog cursor), so we keep them separate to
+	// avoid accidental cross-talk.
+	dest logDest
+	err  error
 }
+
+type logDest int
+
+const (
+	logDestSection logDest = iota
+	logDestFile
+)
 
 type commitTreeMsg struct {
 	root string
@@ -349,17 +379,34 @@ func pathExcluded(p string, excludePaths []string) bool {
 	return false
 }
 
-func loadLogCmd(root string) tea.Cmd {
+// loadLogCmd loads one page of commits for a section's log. gen is the
+// section's LogReloadGen at dispatch time; the handler drops the message
+// when the section's gen has been bumped (manual refresh / watcher event)
+// while this load was in flight.
+func loadLogCmd(root string, skip, gen int) tea.Cmd {
 	return func() tea.Msg {
-		c, err := git.Log(root, logLimit)
-		return logMsg{root: root, commits: c, err: err}
+		c, err := git.Log(root, logPageSize, skip)
+		return logMsg{root: root, skip: skip, gen: gen, commits: c, err: err, dest: logDestSection}
 	}
+}
+
+// reloadSectionLog clears the section's log state, bumps its reload
+// generation, and dispatches a fresh first-page load. Used by mode entry
+// for the active section, by header-expand for collapsed sections, and by
+// RefreshMsg for the section a watcher event referenced.
+func reloadSectionLog(s *WorktreeSection) tea.Cmd {
+	s.LogReloadGen++
+	s.LogCommits = nil
+	s.LogLoaded = false
+	s.LogHasMore = false
+	s.LogLoading = true
+	return loadLogCmd(s.WT.Root, 0, s.LogReloadGen)
 }
 
 func loadFileLogCmd(root, path string) tea.Cmd {
 	return func() tea.Msg {
 		c, err := git.LogForPath(root, path, logLimit)
-		return logMsg{root: root, commits: c, err: err}
+		return logMsg{root: root, commits: c, err: err, dest: logDestFile}
 	}
 }
 
@@ -418,7 +465,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, loadStatusCmd(msg.Root, m.mode == ModeAll, m.nestedChildren[msg.Root])
 		case ModeLog:
-			return m, loadLogCmd(m.activeRoot())
+			// Per-section reload: a watcher event names exactly one
+			// worktree's HEAD log dir. Reload only that section's first
+			// page. Empty Root means a manual full refresh — reload every
+			// section's first page so paged offsets reset everywhere.
+			if msg.Root != "" {
+				if idx := findSectionByRoot(m.sections, msg.Root); idx >= 0 {
+					return m, reloadSectionLog(m.sections[idx])
+				}
+				return m, nil
+			}
+			cmds := make([]tea.Cmd, 0, len(m.sections))
+			for _, s := range m.sections {
+				if !s.LogLoaded && !s.LogLoading {
+					continue // collapsed / never-loaded sections stay lazy
+				}
+				cmds = append(cmds, reloadSectionLog(s))
+			}
+			return m, tea.Batch(cmds...)
 		case ModeFileLog:
 			if m.fileLogPath != "" {
 				return m, loadFileLogCmd(m.fileLogRoot, m.fileLogPath)
@@ -484,32 +548,75 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.refreshExpandedHunks()
 
 	case logMsg:
-		// Stale-message drop: a tab-switch may have changed the active section.
-		if msg.root != m.activeRoot() {
+		if msg.dest == logDestFile {
+			// ModeFileLog flat history — single-section as before.
+			if msg.err != nil {
+				m.err = msg.err
+				return m, nil
+			}
+			m.err = nil
+			var prevSHA string
+			if m.commitCursor >= 0 && m.commitCursor < len(m.commits) {
+				prevSHA = m.commits[m.commitCursor].SHA
+			}
+			m.commits = msg.commits
+			m.logLoaded = true
+			m.logRoot = msg.root
+			m.commitCursor = 0
+			if prevSHA != "" {
+				for i, c := range m.commits {
+					if c.SHA == prevSHA {
+						m.commitCursor = i
+						break
+					}
+				}
+			}
+			m.refreshView()
+			return m, nil
+		}
+		// Per-section paged log batch (ModeLog).
+		idx := findSectionByRoot(m.sections, msg.root)
+		if idx < 0 {
+			return m, nil // section removed mid-flight
+		}
+		s := m.sections[idx]
+		if msg.gen != s.LogReloadGen {
+			// Superseded by a refresh; the freshly-reset state must win.
 			return m, nil
 		}
 		if msg.err != nil {
+			s.LogLoading = false
+			s.LogLoaded = true
 			m.err = msg.err
+			m.refreshView()
 			return m, nil
 		}
 		m.err = nil
-		var prevSHA string
-		if m.commitCursor >= 0 && m.commitCursor < len(m.commits) {
-			prevSHA = m.commits[m.commitCursor].SHA
-		}
-		m.commits = msg.commits
-		m.logLoaded = true
-		m.logRoot = msg.root
-		m.commitCursor = 0
-		if prevSHA != "" {
-			for i, c := range m.commits {
-				if c.SHA == prevSHA {
-					m.commitCursor = i
-					break
-				}
+		prevAnchor := m.cursorAnchor()
+		if msg.skip == 0 {
+			s.LogCommits = msg.commits
+		} else {
+			// Defensive: only append when the offset matches what we've
+			// already loaded. Anything else means the load order skewed
+			// against our state; drop rather than splice mismatched commits.
+			if msg.skip != len(s.LogCommits) {
+				s.LogLoading = false
+				return m, nil
 			}
+			s.LogCommits = append(s.LogCommits, msg.commits...)
 		}
-		m.refreshView()
+		s.LogHasMore = len(msg.commits) == logPageSize
+		s.LogLoaded = true
+		s.LogLoading = false
+		if m.mode == ModeLog {
+			m.refreshView()
+			m.restoreCursor(prevAnchor, -1)
+			m.ensureCursorVisible()
+		} else {
+			// View isn't currently displaying this batch; still refresh in
+			// case status counts or footer aggregates use LogCommits.
+			m.refreshView()
+		}
 		return m, nil
 
 	case commitTreeMsg:
@@ -1016,6 +1123,40 @@ func diffNavCount(n *tree.Node) int {
 }
 
 func (m *Model) handleKeyLog(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.mode == ModeLog {
+		// Unified-rows path: ModeLog now uses m.cursor / m.rows like the
+		// tree modes do. Tab jumps between section headers (auto-expanding
+		// and loading) rather than cycling an "active" worktree.
+		switch {
+		case key.Matches(msg, keys.NextWorktree):
+			return *m, m.jumpToSectionHeader(1)
+		case key.Matches(msg, keys.PrevWorktree):
+			return *m, m.jumpToSectionHeader(-1)
+		case key.Matches(msg, keys.Down):
+			m.moveCursor(1)
+			return *m, m.maybeAutoLoadMore()
+		case key.Matches(msg, keys.Up):
+			m.moveCursor(-1)
+			return *m, m.maybeAutoLoadMore()
+		case key.Matches(msg, keys.PgDn):
+			m.moveCursor(m.vp.Height / 2)
+			return *m, m.maybeAutoLoadMore()
+		case key.Matches(msg, keys.PgUp):
+			m.moveCursor(-m.vp.Height / 2)
+			return *m, m.maybeAutoLoadMore()
+		case key.Matches(msg, keys.Top):
+			m.cursor = 0
+			m.refreshViewToCursor()
+		case key.Matches(msg, keys.Bottom):
+			m.cursor = len(m.rows) - 1
+			m.refreshViewToCursor()
+			return *m, m.maybeAutoLoadMore()
+		case key.Matches(msg, keys.Toggle), key.Matches(msg, keys.Right):
+			return *m, m.openCommit()
+		}
+		return *m, nil
+	}
+	// ModeFileLog — flat single-section list with m.commits/m.commitCursor.
 	switch {
 	case key.Matches(msg, keys.NextWorktree):
 		return *m, m.cycleActiveWorktree(1)
@@ -1041,6 +1182,79 @@ func (m *Model) handleKeyLog(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return *m, nil
 }
 
+// jumpToSectionHeader moves the cursor to the next/prev section header
+// (wrapping at boundaries). If the landed-on section is collapsed, expand
+// it and trigger a first-page load on the next render. Used by Tab/⇧Tab
+// in ModeLog.
+func (m *Model) jumpToSectionHeader(d int) tea.Cmd {
+	if len(m.rows) == 0 {
+		return nil
+	}
+	n := len(m.rows)
+	// Walk one row at a time in direction d, starting from cursor+d, until
+	// we find a headerRow or come back to where we started. Using a small
+	// state machine instead of (cursor + d*steps) avoids the off-by-one
+	// risk and keeps modular arithmetic readable.
+	for steps, i := 0, (((m.cursor+d)%n)+n)%n; steps < n; steps, i = steps+1, (((i+d)%n)+n)%n {
+		h, ok := m.rows[i].(headerRow)
+		if !ok {
+			continue
+		}
+		if h.sectionIdx < 0 || h.sectionIdx >= len(m.sections) {
+			continue
+		}
+		s := m.sections[h.sectionIdx]
+		m.cursor = i
+		var cmd tea.Cmd
+		if !s.Expanded {
+			s.Expanded = true
+			// Expanding changes row count; relocate the cursor to the same
+			// section's header before re-rendering.
+			m.refreshView()
+			for j, r := range m.rows {
+				if hr, ok := r.(headerRow); ok && hr.sectionIdx == h.sectionIdx {
+					m.cursor = j
+					break
+				}
+			}
+		}
+		if !s.LogLoaded && !s.LogLoading {
+			cmd = reloadSectionLog(s)
+		}
+		// Re-render so the cursor highlight actually moves on screen;
+		// without this, expanded-section jumps update m.cursor but the
+		// previously-painted row still shows the highlight.
+		m.refreshViewToCursor()
+		return cmd
+	}
+	return nil
+}
+
+// maybeAutoLoadMore checks whether the cursor is now within
+// autoLoadMoreThreshold rows of the last loaded commit in its section and
+// the section has more pages. Returns a tea.Cmd that fetches the next page,
+// or nil if not eligible. Called from cursor-move paths only (Down/Up/PgDn/
+// PgUp/Bottom and mouse click), never from refreshViewToCursor, so window
+// resizes don't fire stray loads.
+func (m *Model) maybeAutoLoadMore() tea.Cmd {
+	c, ok := m.currentRow().(commitRow)
+	if !ok {
+		return nil
+	}
+	if c.sectionIdx < 0 || c.sectionIdx >= len(m.sections) {
+		return nil
+	}
+	s := m.sections[c.sectionIdx]
+	if !s.LogHasMore || s.LogLoading {
+		return nil
+	}
+	if c.idx < len(s.LogCommits)-autoLoadMoreThreshold {
+		return nil
+	}
+	s.LogLoading = true
+	return loadLogCmd(s.WT.Root, len(s.LogCommits), s.LogReloadGen)
+}
+
 func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	if m.mode == ModeSearch {
 		return m.handleSearchMouse(msg)
@@ -1056,9 +1270,38 @@ func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	if msg.Action != tea.MouseActionPress || msg.Button != tea.MouseButtonLeft {
 		return *m, nil
 	}
-	if m.mode == ModeLog || m.mode == ModeFileLog {
+	if m.mode == ModeLog {
+		for i, r := range m.rows {
+			switch row := r.(type) {
+			case commitRow:
+				if z := m.zones.Get(commitZoneID(row.sectionIdx, row.idx)); z.InBounds(msg) {
+					m.cursor = i
+					// openCommit switches mode to ModeCommit, so no
+					// auto-load-more piggyback here — clicking a near-end
+					// commit drills in rather than fetching more.
+					return *m, m.openCommit()
+				}
+			case headerRow:
+				if z := m.zones.Get(headerZoneID(row.sectionIdx)); z.InBounds(msg) {
+					m.cursor = i
+					if row.sectionIdx >= 0 && row.sectionIdx < len(m.sections) {
+						s := m.sections[row.sectionIdx]
+						s.Expanded = !s.Expanded
+						m.refreshView()
+						var cmd tea.Cmd
+						if s.Expanded && !s.LogLoaded && !s.LogLoading {
+							cmd = reloadSectionLog(s)
+						}
+						return *m, cmd
+					}
+				}
+			}
+		}
+		return *m, nil
+	}
+	if m.mode == ModeFileLog {
 		for i := range m.commits {
-			if z := m.zones.Get(commitZoneID(i)); z.InBounds(msg) {
+			if z := m.zones.Get(commitZoneID(-1, i)); z.InBounds(msg) {
 				m.commitCursor = i
 				return *m, m.openCommit()
 			}
@@ -1101,11 +1344,26 @@ func (m *Model) cycleMode() tea.Cmd {
 		m.commitTree = nil
 		m.cursor = 0
 		m.diffCursor = -1
-		if !m.logLoaded || m.logRoot != m.activeRoot() {
-			return loadLogCmd(m.activeRoot())
+		// Active section opens by default; others stay collapsed until the
+		// user expands them (Tab-jump or click-toggle), at which point
+		// their first page is fetched. Active section eager-loads only if
+		// it hasn't been loaded already (e.g. user toggled ModeLog before
+		// in this session).
+		var cmd tea.Cmd
+		for i, s := range m.sections {
+			if i == m.activeWT {
+				s.Expanded = true
+				if !s.LogLoaded && !s.LogLoading {
+					cmd = reloadSectionLog(s)
+				}
+			} else {
+				s.Expanded = false
+			}
 		}
 		m.refreshView()
-		return nil
+		m.positionCursorOnActiveSectionFirstCommit()
+		m.ensureCursorVisible()
+		return cmd
 	case ModeLog, ModeCommit, ModeFileLog:
 		m.mode = ModeChanged
 		m.clearSelectedCommit()
@@ -1127,6 +1385,9 @@ func (m *Model) reloadAllSections(allMode bool) tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
+// cycleActiveWorktree is called in ModeFileLog only — ModeLog uses
+// jumpToSectionHeader to navigate between sections instead, so there's no
+// "active worktree" concept inside the unified log view.
 func (m *Model) cycleActiveWorktree(d int) tea.Cmd {
 	if len(m.sections) <= 1 {
 		return nil
@@ -1136,10 +1397,10 @@ func (m *Model) cycleActiveWorktree(d int) tea.Cmd {
 	m.commits = nil
 	m.logLoaded = false
 	m.refreshView()
-	if m.mode == ModeFileLog {
+	if m.mode == ModeFileLog && m.fileLogPath != "" {
 		return loadFileLogCmd(m.activeRoot(), m.fileLogPath)
 	}
-	return loadLogCmd(m.activeRoot())
+	return nil
 }
 
 func (m *Model) clearSelectedCommit() {
@@ -1151,23 +1412,43 @@ func (m *Model) clearSelectedCommit() {
 }
 
 func (m *Model) openCommit() tea.Cmd {
-	if m.commitCursor < 0 || m.commitCursor >= len(m.commits) {
-		return nil
+	var commit git.Commit
+	var root string
+	switch m.mode {
+	case ModeLog:
+		// Route by the row's owning section, so a commit in nested-a opens
+		// its own diff (not the parent repo's at the same SHA).
+		c, ok := m.currentRow().(commitRow)
+		if !ok || c.sectionIdx < 0 || c.sectionIdx >= len(m.sections) {
+			return nil
+		}
+		s := m.sections[c.sectionIdx]
+		if c.idx < 0 || c.idx >= len(s.LogCommits) {
+			return nil
+		}
+		commit = s.LogCommits[c.idx]
+		root = s.WT.Root
+	default:
+		// ModeFileLog flat list.
+		if m.commitCursor < 0 || m.commitCursor >= len(m.commits) {
+			return nil
+		}
+		commit = m.commits[m.commitCursor]
+		root = m.activeRoot()
 	}
 	m.dropResetOnModeChange()
-	c := m.commits[m.commitCursor]
 	m.commitParent = m.mode
 	m.mode = ModeCommit
-	m.selectedSHA = c.SHA
-	m.selectedShort = c.ShortSHA
-	m.selectedSubject = c.Subject
-	m.selectedRoot = m.activeRoot()
+	m.selectedSHA = commit.SHA
+	m.selectedShort = commit.ShortSHA
+	m.selectedSubject = commit.Subject
+	m.selectedRoot = root
 	m.commitTree = nil
 	m.cursor = 0
 	m.diffCursor = -1
 	m.vp.SetYOffset(0)
 	m.refreshView()
-	return loadCommitTreeCmd(m.selectedRoot, c.SHA)
+	return loadCommitTreeCmd(root, commit.SHA)
 }
 
 func (m *Model) exitCommit() tea.Cmd {
@@ -1219,7 +1500,16 @@ func (m *Model) refreshCmd() tea.Cmd {
 	case ModeAll:
 		return loadInitDataCmd(m.repoRoot, true)
 	case ModeLog:
-		return loadLogCmd(m.activeRoot())
+		// Manual refresh: reload first page of every section that's been
+		// touched so far. Untouched (collapsed/lazy) sections stay lazy.
+		cmds := make([]tea.Cmd, 0, len(m.sections))
+		for _, s := range m.sections {
+			if !s.LogLoaded && !s.LogLoading {
+				continue
+			}
+			cmds = append(cmds, reloadSectionLog(s))
+		}
+		return tea.Batch(cmds...)
 	case ModeFileLog:
 		if m.fileLogPath != "" {
 			return loadFileLogCmd(m.fileLogRoot, m.fileLogPath)
@@ -1277,10 +1567,13 @@ func (m *Model) activeRoot() string {
 // it again after the row list is rebuilt. sectionRoot identifies the
 // worktree section (so same-named files in different sections don't
 // collide); treePath identifies a specific node when the cursor is on a
-// tree row, or is empty when the cursor is on a section header.
+// tree row (Changed/All modes); commitSHA identifies a specific commit
+// when the cursor is on a commit row (Log mode). Both are empty when the
+// cursor is on a section header.
 type cursorAnchor struct {
 	sectionRoot string
 	treePath    string
+	commitSHA   string
 }
 
 func (m *Model) cursorAnchor() cursorAnchor {
@@ -1294,6 +1587,15 @@ func (m *Model) cursorAnchor() cursorAnchor {
 			root = m.sections[r.sectionIdx].WT.Root
 		}
 		return cursorAnchor{sectionRoot: root, treePath: r.node.Path}
+	case commitRow:
+		if r.sectionIdx < 0 || r.sectionIdx >= len(m.sections) {
+			return cursorAnchor{}
+		}
+		s := m.sections[r.sectionIdx]
+		if r.idx < 0 || r.idx >= len(s.LogCommits) {
+			return cursorAnchor{sectionRoot: s.WT.Root}
+		}
+		return cursorAnchor{sectionRoot: s.WT.Root, commitSHA: s.LogCommits[r.idx].SHA}
 	case headerRow:
 		if r.sectionIdx >= 0 && r.sectionIdx < len(m.sections) {
 			return cursorAnchor{sectionRoot: m.sections[r.sectionIdx].WT.Root}
@@ -1311,9 +1613,30 @@ func (m *Model) cursorAnchor() cursorAnchor {
 func (m *Model) restoreCursor(a cursorAnchor, prevDiffCursor int) {
 	m.cursor = 0
 	m.diffCursor = -1
-	if a.sectionRoot == "" && a.treePath == "" {
+	if a.sectionRoot == "" && a.treePath == "" && a.commitSHA == "" {
 		return
 	}
+	// Commit SHA anchor (Log mode). Match by section + SHA.
+	if a.commitSHA != "" {
+		for i, r := range m.rows {
+			c, ok := r.(commitRow)
+			if !ok || c.sectionIdx < 0 || c.sectionIdx >= len(m.sections) {
+				continue
+			}
+			s := m.sections[c.sectionIdx]
+			if s.WT.Root != a.sectionRoot {
+				continue
+			}
+			if c.idx < 0 || c.idx >= len(s.LogCommits) {
+				continue
+			}
+			if s.LogCommits[c.idx].SHA == a.commitSHA {
+				m.cursor = i
+				return
+			}
+		}
+	}
+	// Tree path anchor (Changed/All modes).
 	if a.treePath != "" {
 		for i, r := range m.rows {
 			t, ok := r.(treeRow)
@@ -1334,6 +1657,7 @@ func (m *Model) restoreCursor(a cursorAnchor, prevDiffCursor int) {
 	if a.sectionRoot == "" {
 		return
 	}
+	// Fall back to the section's header row.
 	for i, r := range m.rows {
 		h, ok := r.(headerRow)
 		if !ok || h.sectionIdx < 0 || h.sectionIdx >= len(m.sections) {
@@ -1442,6 +1766,31 @@ func (m *Model) positionCursorOnActiveSection() {
 	}
 }
 
+// positionCursorOnActiveSectionFirstCommit lands the cursor on the first
+// commit of the active section after entering ModeLog. If commits haven't
+// loaded yet, lands on the section's header so the user has a clear
+// "you are here" marker while the page fetches.
+func (m *Model) positionCursorOnActiveSectionFirstCommit() {
+	for i, r := range m.rows {
+		c, ok := r.(commitRow)
+		if !ok {
+			continue
+		}
+		if c.sectionIdx == m.activeWT {
+			m.cursor = i
+			return
+		}
+	}
+	// Fallback: header (single-section repos have no header, so cursor stays 0).
+	for i, r := range m.rows {
+		if h, ok := r.(headerRow); ok && h.sectionIdx == m.activeWT {
+			m.cursor = i
+			return
+		}
+	}
+	m.cursor = 0
+}
+
 // jumpGroup walks the cursor to the next/previous "grouping" row — either a
 // directory tree row OR a section header row. Mirrors the existing folder-
 // jump shortcut, extended to treat section headers as super-folders in
@@ -1518,11 +1867,17 @@ func (m *Model) recomputeViewportHeight() {
 }
 
 func (m *Model) refreshView() {
-	// Always rebuild rows for tree/commit modes — cursor positioning logic
-	// runs before the first WindowSizeMsg arrives, when m.ready is still
-	// false. The viewport-dependent work below is gated separately.
-	if m.mode != ModeSearch && m.mode != ModeLog && m.mode != ModeFileLog {
-		m.rows = m.flattenForView()
+	// Always rebuild rows for tree/commit/log modes — cursor positioning
+	// logic runs before the first WindowSizeMsg arrives, when m.ready is
+	// still false. The viewport-dependent work below is gated separately.
+	// ModeFileLog still uses the flat m.commits list and the legacy direct
+	// renderer below.
+	if m.mode != ModeSearch && m.mode != ModeFileLog {
+		if m.mode == ModeLog {
+			m.rows = flattenSectionsLogs(m.sections, len(m.sections) > 1)
+		} else {
+			m.rows = m.flattenForView()
+		}
 		debugDumpRows(m)
 		defer debugDumpFrame(m)
 		if m.cursor >= len(m.rows) {
@@ -1547,7 +1902,7 @@ func (m *Model) refreshView() {
 		m.vp.SetContent(m.renderSearch())
 		return
 	}
-	if m.mode == ModeLog || m.mode == ModeFileLog {
+	if m.mode == ModeFileLog {
 		if m.commitCursor >= len(m.commits) {
 			m.commitCursor = len(m.commits) - 1
 		}
@@ -1555,6 +1910,10 @@ func (m *Model) refreshView() {
 			m.commitCursor = 0
 		}
 		m.vp.SetContent(m.renderLog())
+		return
+	}
+	if m.mode == ModeLog {
+		m.vp.SetContent(m.renderLogRows())
 		return
 	}
 	m.vp.SetContent(m.renderBody())
@@ -1585,11 +1944,114 @@ func (m *Model) refreshViewToCursor() {
 	if !m.ready {
 		return
 	}
-	if m.mode == ModeLog || m.mode == ModeFileLog {
+	if m.mode == ModeFileLog {
 		m.ensureCommitCursorVisible()
 		return
 	}
 	m.ensureCursorVisible()
+}
+
+// renderLogRows renders ModeLog by walking m.rows. Headers reuse
+// renderSectionHeader (with a log-specific counts trailer); commit rows
+// reuse the existing single-section format. Mouse zones are stamped per
+// row so multi-section clicks route correctly.
+func (m *Model) renderLogRows() string {
+	if len(m.rows) == 0 {
+		if m.err != nil {
+			return errStyle.Render(m.err.Error())
+		}
+		// Determine whether any section has loaded yet — if not, show the
+		// loading hint; otherwise (every section came back empty) say so.
+		anyLoaded, anyLoading := false, false
+		for _, s := range m.sections {
+			if s.LogLoaded {
+				anyLoaded = true
+			}
+			if s.LogLoading {
+				anyLoading = true
+			}
+		}
+		if !anyLoaded && anyLoading {
+			return dimStyle.Render("  loading log…")
+		}
+		return dimStyle.Render("  no commits")
+	}
+	var b strings.Builder
+	for i, r := range m.rows {
+		switch row := r.(type) {
+		case headerRow:
+			line := m.fitWidth(m.renderLogSectionHeader(i, row.sectionIdx))
+			b.WriteString(m.zones.Mark(headerZoneID(row.sectionIdx), line))
+		case commitRow:
+			if row.sectionIdx < 0 || row.sectionIdx >= len(m.sections) {
+				continue
+			}
+			s := m.sections[row.sectionIdx]
+			if row.idx < 0 || row.idx >= len(s.LogCommits) {
+				continue
+			}
+			line := m.fitWidth(m.renderCommitRowAt(i, s.LogCommits[row.idx]))
+			b.WriteString(m.zones.Mark(commitZoneID(row.sectionIdx, row.idx), line))
+		}
+		b.WriteByte('\n')
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// renderLogSectionHeader is renderSectionHeader's log-flavored cousin —
+// same chevron + branch styling, but the trailer reports commit-loading
+// state instead of working-tree change counts.
+func (m *Model) renderLogSectionHeader(rowIdx, sectionIdx int) string {
+	if sectionIdx < 0 || sectionIdx >= len(m.sections) {
+		return ""
+	}
+	s := m.sections[sectionIdx]
+	chev := "▾"
+	if !s.Expanded {
+		chev = "▸"
+	}
+	name := s.WT.Branch
+	if name == "" {
+		name = "(no branch)"
+	} else if name == "(detached)" && len(s.WT.HEAD) >= 7 {
+		name = "(detached @" + s.WT.HEAD[:7] + ")"
+	}
+	if s.Nested && s.Label != "" {
+		name = s.Label + "  " + name
+	}
+	var trailer string
+	switch {
+	case s.LoadErr != nil:
+		trailer = errStyle.Render("(error)")
+	case !s.Expanded:
+		trailer = dimStyle.Render("[collapsed]")
+	case s.LogLoading && !s.LogLoaded:
+		trailer = dimStyle.Render("(loading…)")
+	case !s.LogLoaded:
+		trailer = dimStyle.Render("(pending)")
+	case len(s.LogCommits) == 0:
+		trailer = dimStyle.Render("(no commits)")
+	default:
+		count := strconv.Itoa(len(s.LogCommits))
+		if s.LogHasMore {
+			count += "+"
+		}
+		trailer = dimStyle.Render("(" + count + " commits)")
+	}
+	row := fmt.Sprintf("%s %s  %s", chev, dirStyle.Render(name), trailer)
+	return m.applyCursor(row, rowIdx == m.cursor)
+}
+
+// renderCommitRowAt formats a single commit row at the given m.rows index.
+// Separate from renderCommitRow (which uses m.commitCursor for highlight)
+// so the unified-rows path stays consistent with tree-mode rendering.
+func (m *Model) renderCommitRowAt(rowIdx int, c git.Commit) string {
+	sha := addsStyle.Render(c.ShortSHA)
+	date := dimStyle.Render(c.Date)
+	author := dimStyle.Render(truncate(c.Author, 14))
+	subj := fileStyle.Render(c.Subject)
+	row := fmt.Sprintf("%s  %s  %s  %s", sha, date, author, subj)
+	return m.applyCursor(row, rowIdx == m.cursor)
 }
 
 func (m *Model) ensureCursorVisible() {
@@ -1698,8 +2160,15 @@ func (m Model) footer() string {
 	}
 	wtCrumb := m.worktreeCrumb()
 	if m.mode == ModeLog {
-		left := fmt.Sprintf("[log] %d commits", len(m.commits))
-		return helpStyle.Render(left+wtCrumb+" · enter open · a toggle · ? help") +
+		var loaded, sections int
+		for _, s := range m.sections {
+			if s.LogLoaded {
+				sections++
+				loaded += len(s.LogCommits)
+			}
+		}
+		left := fmt.Sprintf("[log] %d commits in %d sections", loaded, sections)
+		return helpStyle.Render(left+" · enter open · tab next section · a toggle · ? help") +
 			helpStyle.Render(m.tabHint())
 	}
 	if m.mode == ModeFileLog {
@@ -1825,7 +2294,7 @@ func (m *Model) renderLog() string {
 	var b strings.Builder
 	for i, c := range m.commits {
 		row := m.fitWidth(m.renderCommitRow(i, c))
-		b.WriteString(m.zones.Mark(commitZoneID(i), row))
+		b.WriteString(m.zones.Mark(commitZoneID(-1, i), row))
 		b.WriteByte('\n')
 	}
 	return strings.TrimRight(b.String(), "\n")
@@ -2078,7 +2547,13 @@ func (m *Model) renderHelpBody() string {
 }
 
 func zoneID(i int) string             { return fmt.Sprintf("row-%d", i) }
-func commitZoneID(i int) string       { return fmt.Sprintf("commit-%d", i) }
+// commitZoneID identifies a commit row for mouse hit-testing. In ModeLog
+// the unified row list may carry commits from multiple sections, so the
+// section index is part of the key; in ModeFileLog (single-section flat
+// list) section is -1.
+func commitZoneID(sectionIdx, idx int) string {
+	return fmt.Sprintf("commit-%d-%d", sectionIdx, idx)
+}
 func headerZoneID(sectionIdx int) string { return fmt.Sprintf("wt-%d", sectionIdx) }
 
 func truncate(s string, w int) string {
