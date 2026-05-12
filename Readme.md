@@ -9,6 +9,7 @@ A focused terminal UI for browsing your working-tree git diff as a sparse, colla
 - **Sparse tree** — only changed paths appear; single-child directory chains are collapsed (`src/foo/bar/`).
 - **Inline expansion** — press <kbd>enter</kbd> on a file to reveal the syntax-highlighted unified diff under the row, no pager handoff.
 - **Multi-worktree split sidebar** — every linked git worktree of the same repo gets its own collapsible section in one pane, so feature-branch worktrees and the main checkout are side-by-side without juggling terminals.
+- **Nested repos & submodules** — any independent git repo or submodule discovered under the working tree becomes its own section with its own branch, status, and watcher. Monorepo-style layouts with a frontend / backend split, or projects pulling in submodules, show up correctly without launching gdui separately in each.
 - **Live updates** — fsnotify-backed file watcher refreshes the tree on disk changes (200 ms debounce), and refreshes the log view when a new commit lands. Useful when an agent is editing files or committing in another pane.
 - **Three view modes** — cycle with <kbd>a</kbd> between *changed only*, *all tracked files*, and *commit log*; pick a commit to drill into its file tree.
 - **Per-file history** — press <kbd>b</kbd> on any file to list every commit that touched it (renames followed via `git log --follow`); <kbd>enter</kbd> drills into a commit's diff.
@@ -130,6 +131,12 @@ From *changed* or *all*, press <kbd>b</kbd> on any file row to open a **file his
 If the repo has linked worktrees (`git worktree add …`), each one renders as its own collapsible section in the same pane, ordered by `git worktree list`. The launch directory's worktree is the initial *active* one — it determines which section the cursor opens on, and which worktree's data is shown in the log / commit / file-history modes. Use <kbd>tab</kbd> / <kbd>⇧tab</kbd> there to cycle the active worktree without leaving the mode.
 
 The file watcher runs once per worktree, so a save in any of them refreshes only the affected section. The tree filter (<kbd>f</kbd>) applies across all sections simultaneously, so you can spot a file by name regardless of which worktree it lives in.
+
+### Nested repos & submodules
+
+Any independent git repository or submodule found beneath the launch worktree shows up as an additional section, alongside the parent and any of its linked worktrees. A monorepo with `parent/` and `parent/frontend/.git` lands as two sections; a project with submodules lands as the parent plus one section per submodule. Each nested section has its own branch, status, file watcher, and log view, and is labelled with its path relative to the parent so two repos on the same branch name stay distinguishable.
+
+Discovery walks the working tree once at startup (skipping `.git`, `node_modules`, `vendor`); nested repos created during a session need a manual <kbd>r</kbd> to appear and a gdui restart to get their own watcher. Searching (<kbd>/</kbd>) is scoped to the active section, so a search in a nested repo only returns its own files.
 
 ### Filtering the tree
 

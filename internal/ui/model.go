@@ -67,6 +67,13 @@ type Model struct {
 	sections []*WorktreeSection
 	activeWT int
 
+	// nestedChildren maps each parent worktree's absolute root to the list
+	// of relative paths of nested git repos that live directly under it.
+	// Used to exclude those paths from the parent's status (they'd otherwise
+	// appear as opaque untracked directories). Populated by applyInitData;
+	// consulted by loadStatusCmd via excludePathsFor.
+	nestedChildren map[string][]string
+
 	// rows is the unified flat row list rendered in the current mode.
 	rows       []displayRow
 	cursor     int
@@ -156,9 +163,13 @@ type RefreshMsg struct {
 // everything in one cmd avoids the test/runtime complexity of tea.Batch fan-out.
 type initDataMsg struct {
 	worktrees []git.Worktree
-	statuses  map[string]sectionStatus
-	allMode   bool
-	err       error
+	// nested is the subset of worktrees that were discovered by walking the
+	// working tree (nested git repos / submodules), as opposed to those
+	// returned by `git worktree list` on the launch repo. Keyed by Root.
+	nested   map[string]bool
+	statuses map[string]sectionStatus
+	allMode  bool
+	err      error
 }
 
 type sectionStatus struct {
@@ -200,26 +211,93 @@ func loadInitDataCmd(repoRoot string, allMode bool) tea.Cmd {
 		if err != nil {
 			return initDataMsg{err: err, allMode: allMode}
 		}
-		statuses := map[string]sectionStatus{}
-		for _, wt := range wts {
-			statuses[wt.Root] = loadSectionStatus(wt.Root, allMode)
+		// Append nested git repos (independent or submodules) found under the
+		// launch repo's worktrees so each becomes its own section.
+		nestedRepos := git.DiscoverNestedReposRecursive(wts, 0)
+		nested := make(map[string]bool, len(nestedRepos))
+		for _, n := range nestedRepos {
+			nested[n.Root] = true
 		}
-		return initDataMsg{worktrees: wts, statuses: statuses, allMode: allMode}
+		all := append([]git.Worktree(nil), wts...)
+		all = append(all, nestedRepos...)
+		// Build a per-parent map of nested child relative paths so each
+		// parent's status excludes its nested repos (otherwise git would
+		// surface them as opaque untracked directories, polluting the
+		// parent's tree).
+		childPaths := nestedChildPathsMap(all, nested)
+		statuses := map[string]sectionStatus{}
+		for _, wt := range all {
+			statuses[wt.Root] = loadSectionStatus(wt.Root, allMode, childPaths[wt.Root])
+		}
+		return initDataMsg{worktrees: all, nested: nested, statuses: statuses, allMode: allMode}
 	}
 }
 
-func loadStatusCmd(root string, allMode bool) tea.Cmd {
+// nestedChildPathsMap returns, for each worktree root, the list of paths
+// (relative to that root) of nested repos that live directly inside it.
+// Nested-inside-nested repos attach to the innermost parent. Used to filter
+// each section's ChangedFile list so a nested-repo directory doesn't appear
+// as an untracked entry in its parent's tree.
+func nestedChildPathsMap(all []git.Worktree, nested map[string]bool) map[string][]string {
+	out := map[string][]string{}
+	// Collect candidate parent roots (everything that could host a nested
+	// repo — both linked worktrees and nested repos that have repos
+	// themselves underneath them).
+	parents := make([]string, 0, len(all))
+	for _, w := range all {
+		parents = append(parents, filepath.Clean(w.Root))
+	}
+	for _, w := range all {
+		if !nested[w.Root] {
+			continue
+		}
+		childAbs := filepath.Clean(w.Root)
+		// Pick the longest parent path that's a strict ancestor of this
+		// nested root — that's the section this child should attach to.
+		best := ""
+		for _, p := range parents {
+			if p == childAbs {
+				continue
+			}
+			if !strings.HasPrefix(childAbs, p+string(filepath.Separator)) {
+				continue
+			}
+			if len(p) > len(best) {
+				best = p
+			}
+		}
+		if best == "" {
+			continue
+		}
+		if rel, err := filepath.Rel(best, childAbs); err == nil {
+			// Normalize to forward slashes — git always emits paths with
+			// '/' regardless of OS (we pass core.quotepath=false to status),
+			// while filepath.Rel uses the OS separator. Without this, the
+			// filter would silently miss matches on Windows.
+			out[best] = append(out[best], filepath.ToSlash(rel))
+		}
+	}
+	return out
+}
+
+func loadStatusCmd(root string, allMode bool, excludeRelPaths []string) tea.Cmd {
 	return func() tea.Msg {
-		st := loadSectionStatus(root, allMode)
+		st := loadSectionStatus(root, allMode, excludeRelPaths)
 		return statusMsg{root: root, files: st.files, tree: st.tree, err: st.err}
 	}
 }
 
-func loadSectionStatus(root string, allMode bool) sectionStatus {
+// loadSectionStatus loads one section's status, optionally filtering out
+// ChangedFile entries whose paths match any of excludeRelPaths. Used to
+// drop nested-repo directories from a parent section's tree (they appear
+// as opaque untracked entries in `git status` since git won't descend into
+// a directory containing its own .git).
+func loadSectionStatus(root string, allMode bool, excludeRelPaths []string) sectionStatus {
 	files, err := git.Status(root)
 	if err != nil {
 		return sectionStatus{err: err}
 	}
+	files = filterChangedFiles(files, excludeRelPaths)
 	if !allMode {
 		return sectionStatus{files: files, tree: tree.Build(files)}
 	}
@@ -227,7 +305,48 @@ func loadSectionStatus(root string, allMode bool) sectionStatus {
 	if err != nil {
 		return sectionStatus{files: files, err: err}
 	}
+	all = filterPaths(all, excludeRelPaths)
 	return sectionStatus{files: files, tree: tree.BuildAll(files, all)}
+}
+
+// filterChangedFiles removes entries whose Path equals any excludePath (or
+// is rooted at a directory equal to one). Returns the input unchanged when
+// excludePaths is empty (common case for nested-repo sections themselves).
+func filterChangedFiles(files []git.ChangedFile, excludePaths []string) []git.ChangedFile {
+	if len(excludePaths) == 0 {
+		return files
+	}
+	out := files[:0:0]
+	for _, f := range files {
+		if pathExcluded(f.Path, excludePaths) {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
+func filterPaths(paths []string, excludePaths []string) []string {
+	if len(excludePaths) == 0 {
+		return paths
+	}
+	out := paths[:0:0]
+	for _, p := range paths {
+		if pathExcluded(p, excludePaths) {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+func pathExcluded(p string, excludePaths []string) bool {
+	for _, ex := range excludePaths {
+		if p == ex || strings.HasPrefix(p, ex+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func loadLogCmd(root string) tea.Cmd {
@@ -297,7 +416,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if findSectionByRoot(m.sections, msg.Root) < 0 {
 				return m, nil
 			}
-			return m, loadStatusCmd(msg.Root, m.mode == ModeAll)
+			return m, loadStatusCmd(msg.Root, m.mode == ModeAll, m.nestedChildren[msg.Root])
 		case ModeLog:
 			return m, loadLogCmd(m.activeRoot())
 		case ModeFileLog:
@@ -305,7 +424,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, loadFileLogCmd(m.fileLogRoot, m.fileLogPath)
 			}
 		case ModeSearch:
-			return m, loadSearchPathsCmd(m.repoRoot)
+			return m, loadSearchPathsCmd(m.activeRoot())
 		}
 		return m, nil
 
@@ -496,7 +615,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Advance the queue first (may prompt for the next drop), then
 		// reload the destination section's status.
 		advance := m.advanceDropQueue()
-		reload := loadStatusCmd(root, m.mode == ModeAll)
+		reload := loadStatusCmd(root, m.mode == ModeAll, m.nestedChildren[root])
 		return m, tea.Batch(advance, reload)
 
 	case dropFailedMsg:
@@ -523,6 +642,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // the worktree root survives the refresh.
 func (m *Model) applyInitData(msg initDataMsg) {
 	prev := m.sections
+	// Collect non-nested worktree roots up front so nested section labels can
+	// be computed as "path relative to the parent worktree this nested repo
+	// lives under" (the longest non-nested root that's a prefix).
+	parentRoots := make([]string, 0, len(msg.worktrees))
+	for _, wt := range msg.worktrees {
+		if !msg.nested[wt.Root] {
+			parentRoots = append(parentRoots, wt.Root)
+		}
+	}
+	// Refresh the parent→nested-children map so per-section refreshes
+	// (RefreshMsg-driven) can keep filtering nested-repo dirs out of their
+	// parent's status.
+	m.nestedChildren = nestedChildPathsMap(msg.worktrees, msg.nested)
 	newSecs := make([]*WorktreeSection, 0, len(msg.worktrees))
 	for _, wt := range msg.worktrees {
 		st := msg.statuses[wt.Root]
@@ -530,7 +662,10 @@ func (m *Model) applyInitData(msg initDataMsg) {
 		if i := findSectionByRoot(prev, wt.Root); i >= 0 {
 			prevSec = prev[i]
 		}
-		s := &WorktreeSection{WT: wt}
+		s := &WorktreeSection{WT: wt, Nested: msg.nested[wt.Root]}
+		if s.Nested {
+			s.Label = nestedSectionLabel(wt.Root, parentRoots)
+		}
 		if prevSec != nil {
 			s.Expanded = prevSec.Expanded
 			s.firstLoadDone = prevSec.firstLoadDone
@@ -987,7 +1122,7 @@ func (m *Model) reloadAllSections(allMode bool) tea.Cmd {
 	}
 	cmds := make([]tea.Cmd, 0, len(m.sections))
 	for _, s := range m.sections {
-		cmds = append(cmds, loadStatusCmd(s.WT.Root, allMode))
+		cmds = append(cmds, loadStatusCmd(s.WT.Root, allMode, m.nestedChildren[s.WT.Root]))
 	}
 	return tea.Batch(cmds...)
 }
@@ -1793,6 +1928,11 @@ func (m *Model) renderSectionHeader(rowIdx, sectionIdx int) string {
 		name = "(no branch)"
 	} else if name == "(detached)" && len(s.WT.HEAD) >= 7 {
 		name = "(detached @" + s.WT.HEAD[:7] + ")"
+	}
+	if s.Nested && s.Label != "" {
+		// Show "<rel-path>  <branch>" so two nested repos on the same branch
+		// name remain distinguishable.
+		name = s.Label + "  " + name
 	}
 	mods, untr := 0, 0
 	for _, f := range s.Files {

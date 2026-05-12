@@ -1,6 +1,9 @@
 package ui
 
 import (
+	"path/filepath"
+	"strings"
+
 	"github.com/andreas-bergstrom/gdui/internal/git"
 	"github.com/andreas-bergstrom/gdui/internal/tree"
 )
@@ -17,6 +20,18 @@ type WorktreeSection struct {
 	Root     *tree.Node        // built tree (Changed/All mode); nil while loading
 	Expanded bool              // section-header collapse state
 	LoadErr  error
+
+	// Nested is true when this section represents a nested git repo
+	// (independent repo or submodule) discovered by walking a parent
+	// worktree, rather than a linked worktree returned by `git worktree
+	// list`. The header renders a path label so users can tell sections
+	// apart when branch names collide.
+	Nested bool
+	// Label is the display string prefixed to the header for nested
+	// sections — the nested repo's path relative to its parent worktree
+	// (or filepath.Base of its root as a fallback). Empty for non-nested
+	// sections.
+	Label string
 
 	// firstLoadDone toggles after the first statusMsg arrives, so we can
 	// auto-expand sections that have changes the first time we see them
@@ -101,4 +116,34 @@ func asTreeRow(r displayRow) *tree.Node {
 // after status loads. Used to decide auto-expand on first load.
 func sectionHasChanges(s *WorktreeSection) bool {
 	return len(s.Files) > 0
+}
+
+// nestedSectionLabel returns the path of `nestedRoot` relative to the
+// longest entry in `parentRoots` that is a proper ancestor of it. Falls
+// back to filepath.Base on the nested root when no parent matches (e.g.
+// gdui launched from inside a nested repo so the parent is unknown).
+//
+// Picking the longest matching parent ensures that, if nested repos are
+// themselves nested under another nested repo, the label is short and
+// relative to the *closest* parent — not the launch root.
+func nestedSectionLabel(nestedRoot string, parentRoots []string) string {
+	nestedRoot = filepath.Clean(nestedRoot)
+	best := ""
+	for _, p := range parentRoots {
+		p = filepath.Clean(p)
+		if !strings.HasPrefix(nestedRoot, p+string(filepath.Separator)) {
+			continue
+		}
+		if len(p) > len(best) {
+			best = p
+		}
+	}
+	if best == "" {
+		return filepath.Base(nestedRoot)
+	}
+	rel, err := filepath.Rel(best, nestedRoot)
+	if err != nil {
+		return filepath.Base(nestedRoot)
+	}
+	return rel
 }

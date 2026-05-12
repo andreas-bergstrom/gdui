@@ -110,7 +110,7 @@ func (m *Model) enterSearch() tea.Cmd {
 		// Re-search with whatever query is already in the field (typically empty).
 		return m.kickSearch()
 	}
-	return loadSearchPathsCmd(m.repoRoot)
+	return loadSearchPathsCmd(m.activeRoot())
 }
 
 func (m *Model) exitSearch() tea.Cmd {
@@ -135,7 +135,7 @@ func (m *Model) kickSearch() tea.Cmd {
 	seq := m.search.pendingQ
 	q := m.search.query
 	paths := m.search.paths
-	return runSearchCmd(m.repoRoot, paths, q, seq)
+	return runSearchCmd(m.activeRoot(), paths, q, seq)
 }
 
 // --- key handling ---
