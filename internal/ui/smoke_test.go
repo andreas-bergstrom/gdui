@@ -17,7 +17,7 @@ import (
 // window-size message to the model and returns its current rendered frame.
 func drive(t *testing.T, repo string) (Model, string) {
 	t.Helper()
-	m := New(repo)
+	m := New(repo, nil)
 	cmd := m.Init()
 	if cmd == nil {
 		t.Fatal("Init returned nil cmd")

@@ -12,7 +12,7 @@ import (
 // driveReady returns a Model with a ready viewport so View() doesn't bail.
 func driveReady(t *testing.T) Model {
 	t.Helper()
-	m := New("/tmp/gd-test-not-used")
+	m := New("/tmp/gd-test-not-used", nil)
 	mi, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
 	return mi.(Model)
 }

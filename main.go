@@ -35,17 +35,31 @@ func main() {
 		os.Exit(1)
 	}
 
-	m := ui.New(root)
+	// prog is referenced by the restartWatchers closure below before it's
+	// assigned; that's fine because restart is only invoked from inside the
+	// tea event loop, well after tea.NewProgram returns. Pointer-deref via
+	// closure capture keeps the tea.Program / model bootstrap acyclic.
+	var prog *tea.Program
+	var stops []func()
+	restartWatchers := func() {
+		for _, s := range stops {
+			s()
+		}
+		stops = startWatchers(root, prog)
+	}
+
+	m := ui.New(root, restartWatchers)
 	// Bracketed paste is on by default in Bubble Tea v1.3+; the drag-drop
 	// import flow in internal/ui/drop.go relies on it (paste arrives as a
 	// KeyMsg with msg.Paste == true). Don't add tea.WithoutBracketedPaste()
 	// without removing the drop handler first.
-	prog := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	prog = tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 
 	// Spawn one file watcher per linked worktree so HEAD-event auto-refresh
-	// works regardless of which worktree was edited. List once at startup —
-	// worktrees added/removed mid-session require restarting gdui.
-	stops := startWatchers(root, prog)
+	// works regardless of which worktree was edited. The manual-refresh path
+	// (`r`) calls restartWatchers above to re-list and respawn, so worktrees
+	// added/removed mid-session are picked up without restarting gdui.
+	stops = startWatchers(root, prog)
 	defer func() {
 		for _, s := range stops {
 			s()

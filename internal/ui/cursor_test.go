@@ -26,7 +26,7 @@ func driveMultiSection(t *testing.T) Model {
 	b.firstLoadDone = true
 	c.firstLoadDone = true
 
-	m := New("/repo/master")
+	m := New("/repo/master", nil)
 	m.zones = zone.New()
 	m.sections = []*WorktreeSection{a, b, c}
 	m.activeWT = 0

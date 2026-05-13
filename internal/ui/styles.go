@@ -12,6 +12,7 @@ var (
 	dimStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#565f89"))
 	errStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#f7768e"))
 	helpStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#565f89"))
+	toastStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#9ece6a")).Bold(true)
 	kindStyle   = map[byte]lipgloss.Style{
 		'M': lipgloss.NewStyle().Foreground(lipgloss.Color("#e0af68")),
 		'A': lipgloss.NewStyle().Foreground(lipgloss.Color("#9ece6a")),

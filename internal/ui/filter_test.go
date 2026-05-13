@@ -157,7 +157,7 @@ func modelWithSection(t *testing.T, paths ...string) Model {
 		files[i] = mkChanged(p)
 	}
 	s := mkSection("/repo", "main", files...)
-	m := New("/repo")
+	m := New("/repo", nil)
 	m.sections = []*WorktreeSection{s}
 	m.activeWT = 0
 	m.ready = true

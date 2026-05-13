@@ -161,14 +161,30 @@ type Model struct {
 	// this, the cursor would snap back to the file the user was looking at
 	// before the drop, not to the newly-imported file.
 	pendingDropTarget cursorAnchor
+
+	// toast is a transient one-line message shown in the footer (e.g.
+	// "reloaded" after `r`). Cleared automatically when toastSeq stops
+	// matching after toastDuration; sequence-matched so a later toast
+	// can't get blown away by an earlier expiration tick.
+	toast     string
+	toastSeq  int
+	toastTime time.Time
+
+	// restartWatchers is invoked from the manual-refresh path to stop the
+	// current fs watchers and respawn them against the freshly-discovered
+	// worktree + nested-repo list. Wired in from main.go via New so the
+	// model doesn't need to import internal/watch. Nil-safe: nil means no
+	// watcher restart (used in tests).
+	restartWatchers func()
 }
 
-func New(repoRoot string) Model {
+func New(repoRoot string, restartWatchers func()) Model {
 	return Model{
-		repoRoot:   repoRoot,
-		mode:       ModeChanged,
-		zones:      zone.New(),
-		diffCursor: -1,
+		repoRoot:        repoRoot,
+		mode:            ModeChanged,
+		zones:           zone.New(),
+		diffCursor:      -1,
+		restartWatchers: restartWatchers,
 	}
 }
 
@@ -244,6 +260,24 @@ type commitTreeMsg struct {
 	sha  string
 	tree *tree.Node
 	err  error
+}
+
+type infoToastExpiredMsg struct {
+	seq int
+}
+
+// setInfoToast stores a short transient message and returns a Cmd that fires
+// an expiration tick. Use for "happened-and-finished" UX confirmations like
+// manual refresh. The seq match in the handler ensures rapid successive
+// toasts don't clobber each other.
+func (m *Model) setInfoToast(text string) tea.Cmd {
+	m.toastSeq++
+	m.toast = text
+	m.toastTime = time.Now()
+	seq := m.toastSeq
+	return tea.Tick(toastDuration, func(time.Time) tea.Msg {
+		return infoToastExpiredMsg{seq: seq}
+	})
 }
 
 type hunksMsg struct {
@@ -693,6 +727,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case infoToastExpiredMsg:
+		if msg.seq == m.toastSeq {
+			m.toast = ""
+		}
+		return m, nil
+
 	case branchListMsg:
 		if m.mode != ModeBranchPicker || msg.root != m.branchPicker.root {
 			return m, nil // stale
@@ -1094,7 +1134,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.showHelp = !m.showHelp
 		return m, nil
 	case key.Matches(msg, keys.Refresh):
-		return *m, m.refreshCmd()
+		return *m, tea.Batch(m.refreshCmd(), m.setInfoToast("reloaded"))
 	case key.Matches(msg, keys.Search):
 		return *m, m.enterSearch()
 	case key.Matches(msg, keys.ToggleAll):
@@ -1674,8 +1714,17 @@ func (m *Model) exitFileLog() tea.Cmd {
 func (m *Model) refreshCmd() tea.Cmd {
 	switch m.mode {
 	case ModeChanged:
+		// Manual refresh restarts fs watchers as well so newly-added
+		// worktrees / nested repos gain a watcher and removed ones stop
+		// firing — gdui used to require a restart for that.
+		if m.restartWatchers != nil {
+			m.restartWatchers()
+		}
 		return loadInitDataCmd(m.repoRoot, false)
 	case ModeAll:
+		if m.restartWatchers != nil {
+			m.restartWatchers()
+		}
 		return loadInitDataCmd(m.repoRoot, true)
 	case ModeLog:
 		// Manual refresh: reload first page of every section that's been
@@ -2360,6 +2409,9 @@ func (m Model) footer() string {
 	}
 	if m.err != nil {
 		return errStyle.Render("error: " + m.err.Error())
+	}
+	if m.toast != "" && time.Since(m.toastTime) < toastDuration {
+		return toastStyle.Render("✓ " + m.toast)
 	}
 	wtCrumb := m.worktreeCrumb()
 	if m.mode == ModeLog {
