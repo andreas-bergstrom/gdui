@@ -13,6 +13,7 @@ type keymap struct {
 	Search                            key.Binding
 	Filter                            key.Binding
 	NextWorktree, PrevWorktree        key.Binding
+	Revert                            key.Binding
 }
 
 var keys = keymap{
@@ -37,4 +38,5 @@ var keys = keymap{
 	Filter:       key.NewBinding(key.WithKeys("f"), key.WithHelp("f", "filter tree")),
 	NextWorktree: key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "next worktree (log)")),
 	PrevWorktree: key.NewBinding(key.WithKeys("shift+tab"), key.WithHelp("⇧tab", "prev worktree (log)")),
+	Revert:       key.NewBinding(key.WithKeys("X"), key.WithHelp("X", "revert to HEAD")),
 }

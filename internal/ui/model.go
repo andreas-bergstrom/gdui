@@ -137,6 +137,10 @@ type Model struct {
 	// of tree modes — see dropResetOnModeChange.
 	drop dropState
 
+	// revert holds the "revert to HEAD" confirmation state. Same gate
+	// pattern as drop — see revertResetOnModeChange.
+	revert revertState
+
 	// pendingDropTarget tells the next statusMsg handler where to place the
 	// cursor instead of restoring the pre-refresh position. Set in the
 	// dropCompletedMsg handler, consumed (and cleared) by statusMsg. Without
@@ -725,6 +729,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		reload := loadStatusCmd(root, m.mode == ModeAll, m.nestedChildren[root])
 		return m, tea.Batch(advance, reload)
 
+	case revertCompletedMsg:
+		root := msg.root
+		m.revert = revertState{}
+		if m.mode == ModeChanged || m.mode == ModeAll {
+			return m, tea.Batch(
+				loadStatusCmd(root, m.mode == ModeAll, m.nestedChildren[root]),
+				tea.ClearScreen,
+			)
+		}
+		return m, tea.ClearScreen
+
+	case revertFailedMsg:
+		m.revert = revertState{err: msg.err.Error()}
+		m.refreshView()
+		return m, tea.ClearScreen
+
 	case dropFailedMsg:
 		// Pop the failed drop off the queue (queue[0] was the one being
 		// copied) and surface the error in the status row. Subsequent
@@ -920,6 +940,21 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleKeyDrop(msg)
 	}
 
+	// Revert-prompt gate. Drop and revert are mutually exclusive — only one
+	// can be active at a time. Esc on a sticky revert error clears it the
+	// same way the drop branch above handles m.drop.err.
+	if msg.Type == tea.KeyEsc && m.revert.phase == revertIdle && m.revert.err != "" {
+		m.revert.err = ""
+		m.refreshView()
+		return *m, tea.ClearScreen
+	}
+	if m.revert.active() {
+		if msg.Type == tea.KeyCtrlC {
+			return m, tea.Quit
+		}
+		return m.handleKeyRevert(msg)
+	}
+
 	if m.mode == ModeSearch {
 		if msg.Type == tea.KeyCtrlC {
 			return m, tea.Quit
@@ -983,6 +1018,8 @@ func (m *Model) handleKeyTree(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return *m, nil
 		}
 		return *m, m.openFileLog(m.currentSectionRoot(), n.Path)
+	case key.Matches(msg, keys.Revert):
+		return *m, m.initRevert()
 	case key.Matches(msg, keys.Down):
 		m.moveDown()
 	case key.Matches(msg, keys.Up):
@@ -1335,6 +1372,7 @@ func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 func (m *Model) cycleMode() tea.Cmd {
 	m.vp.SetYOffset(0)
 	m.dropResetOnModeChange()
+	m.revertResetOnModeChange()
 	switch m.mode {
 	case ModeChanged:
 		m.mode = ModeAll
@@ -1437,6 +1475,7 @@ func (m *Model) openCommit() tea.Cmd {
 		root = m.activeRoot()
 	}
 	m.dropResetOnModeChange()
+	m.revertResetOnModeChange()
 	m.commitParent = m.mode
 	m.mode = ModeCommit
 	m.selectedSHA = commit.SHA
@@ -1465,6 +1504,7 @@ func (m *Model) exitCommit() tea.Cmd {
 
 func (m *Model) openFileLog(root, path string) tea.Cmd {
 	m.dropResetOnModeChange()
+	m.revertResetOnModeChange()
 	m.prevTreeMode = m.mode
 	m.mode = ModeFileLog
 	m.fileLogPath = path
@@ -2125,6 +2165,9 @@ func (m Model) View() string {
 	}
 	if m.drop.visible() && !m.showHelp {
 		parts = append(parts, m.fitWidth(m.renderDropStatus()))
+	}
+	if m.revert.visible() && !m.showHelp {
+		parts = append(parts, m.fitWidth(m.renderRevertStatus()))
 	}
 	parts = append(parts, footer)
 	return m.zones.Scan(lipgloss.JoinVertical(lipgloss.Left, parts...))

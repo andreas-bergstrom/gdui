@@ -101,6 +101,7 @@ func (m *Model) enterSearch() tea.Cmd {
 		return nil
 	}
 	m.dropResetOnModeChange()
+	m.revertResetOnModeChange()
 	m.search.prevMode = m.mode
 	m.mode = ModeSearch
 	m.search.cursor = 0
