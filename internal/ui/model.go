@@ -1012,6 +1012,14 @@ func (m *Model) handleKeyTree(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
 	case key.Matches(msg, keys.Filter):
 		return *m, m.enterFilterEdit()
+	case key.Matches(msg, keys.NextWorktree):
+		if m.showSectionHeaders() {
+			return *m, m.jumpSectionWithRepaint(prevRow, 1)
+		}
+	case key.Matches(msg, keys.PrevWorktree):
+		if m.showSectionHeaders() {
+			return *m, m.jumpSectionWithRepaint(prevRow, -1)
+		}
 	case key.Matches(msg, keys.Blame):
 		n := m.currentTreeNode()
 		if n == nil || n.IsDir || n.File == nil {
@@ -1219,6 +1227,23 @@ func (m *Model) handleKeyLog(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return *m, nil
 }
 
+// jumpSectionWithRepaint wraps jumpToSectionHeader with the bubbletea
+// partial-redraw workaround documented in CLAUDE.md: crossing between a
+// tree row and a section header leaves stale cursor highlight unless we
+// force a full repaint. The early-returning Tab cases bypass the
+// needsRepaintAfterMove check at the bottom of handleKeyTree, so apply
+// it here at the call site instead.
+func (m *Model) jumpSectionWithRepaint(prev displayRow, d int) tea.Cmd {
+	cmd := m.jumpToSectionHeader(d)
+	if needsRepaintAfterMove(prev, m.currentRow()) {
+		if cmd == nil {
+			return tea.ClearScreen
+		}
+		return tea.Batch(cmd, tea.ClearScreen)
+	}
+	return cmd
+}
+
 // jumpToSectionHeader moves the cursor to the next/prev section header
 // (wrapping at boundaries). If the landed-on section is collapsed, expand
 // it and trigger a first-page load on the next render. Used by Tab/⇧Tab
@@ -1255,7 +1280,7 @@ func (m *Model) jumpToSectionHeader(d int) tea.Cmd {
 				}
 			}
 		}
-		if !s.LogLoaded && !s.LogLoading {
+		if m.mode == ModeLog && !s.LogLoaded && !s.LogLoading {
 			cmd = reloadSectionLog(s)
 		}
 		// Re-render so the cursor highlight actually moves on screen;
@@ -2527,7 +2552,7 @@ func (m *Model) renderHelpBody() string {
 			{"scroll wheel", "scroll viewport"},
 		}},
 		{"Worktrees", []row{
-			{"tab / ⇧tab", "next / prev worktree (in log mode)"},
+			{"tab / ⇧tab", "next / prev section header (worktrees & nested repos)"},
 		}},
 		{"Search & filter", []row{
 			{"/", "open global search (paths + contents)"},

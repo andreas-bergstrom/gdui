@@ -36,7 +36,7 @@ var keys = keymap{
 	Blame:        key.NewBinding(key.WithKeys("b"), key.WithHelp("b", "file history")),
 	Search:       key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "search")),
 	Filter:       key.NewBinding(key.WithKeys("f"), key.WithHelp("f", "filter tree")),
-	NextWorktree: key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "next worktree (log)")),
-	PrevWorktree: key.NewBinding(key.WithKeys("shift+tab"), key.WithHelp("⇧tab", "prev worktree (log)")),
+	NextWorktree: key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "next section")),
+	PrevWorktree: key.NewBinding(key.WithKeys("shift+tab"), key.WithHelp("⇧tab", "prev section")),
 	Revert:       key.NewBinding(key.WithKeys("X"), key.WithHelp("X", "revert to HEAD")),
 }
