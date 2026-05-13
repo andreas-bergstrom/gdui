@@ -14,6 +14,7 @@ type keymap struct {
 	Filter                            key.Binding
 	NextWorktree, PrevWorktree        key.Binding
 	Revert                            key.Binding
+	Branches                          key.Binding
 }
 
 var keys = keymap{
@@ -39,4 +40,5 @@ var keys = keymap{
 	NextWorktree: key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "next section")),
 	PrevWorktree: key.NewBinding(key.WithKeys("shift+tab"), key.WithHelp("⇧tab", "prev section")),
 	Revert:       key.NewBinding(key.WithKeys("X"), key.WithHelp("X", "revert to HEAD")),
+	Branches:     key.NewBinding(key.WithKeys("B"), key.WithHelp("B", "branch diff")),
 }

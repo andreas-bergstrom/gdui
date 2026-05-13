@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -45,6 +46,8 @@ const (
 	ModeCommit
 	ModeFileLog
 	ModeSearch
+	ModeBranchPicker
+	ModeBranchDiff
 )
 
 func (m viewMode) String() string {
@@ -59,6 +62,10 @@ func (m viewMode) String() string {
 		return "file log"
 	case ModeSearch:
 		return "search"
+	case ModeBranchPicker:
+		return "branch picker"
+	case ModeBranchDiff:
+		return "branch diff"
 	default:
 		return "changed"
 	}
@@ -140,6 +147,13 @@ type Model struct {
 	// revert holds the "revert to HEAD" confirmation state. Same gate
 	// pattern as drop — see revertResetOnModeChange.
 	revert revertState
+
+	// branchPicker is the overlay state for picking a ref. Active only
+	// while mode == ModeBranchPicker.
+	branchPicker branchPickerState
+	// branchDiff is the tree view state for ModeBranchDiff. Mirrors the
+	// commitTree/selected* fields' pattern but for ref-to-HEAD diffs.
+	branchDiff branchDiffState
 
 	// pendingDropTarget tells the next statusMsg handler where to place the
 	// cursor instead of restoring the pre-refresh position. Set in the
@@ -233,7 +247,10 @@ type commitTreeMsg struct {
 }
 
 type hunksMsg struct {
-	root  string
+	root string
+	// ref is set for ModeBranchDiff hunk loads (the source branch of the
+	// merge-base diff). Empty for working-tree and commit hunks.
+	ref   string
 	path  string
 	hunks []git.Hunk
 	err   error
@@ -519,6 +536,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		s := m.sections[idx]
 		if msg.err != nil {
+			// If the worktree directory itself is gone (removed externally
+			// via `git worktree remove` while gdui is running), drop the
+			// section instead of leaving it stuck in an "(error)" state.
+			// The fs watcher for that root will stop emitting once its
+			// goroutine sees the missing dir; until then any further
+			// RefreshMsg{Root: <gone>} no-ops since findSectionByRoot will
+			// return -1.
+			if _, statErr := os.Stat(msg.root); os.IsNotExist(statErr) {
+				m.dropSection(idx)
+				m.refreshView()
+				return m, nil
+			}
 			s.LoadErr = msg.err
 			s.Files = nil
 			s.Root = nil
@@ -640,12 +669,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case hunksMsg:
 		var n *tree.Node
-		// In commit mode, look up in m.commitTree; otherwise look up in the
-		// originating section.
-		if m.mode == ModeCommit && msg.root == m.selectedRoot {
+		// In commit mode, look up in m.commitTree; in branch-diff, in
+		// m.branchDiff.tr; otherwise look up in the originating section.
+		switch {
+		case m.mode == ModeCommit && msg.root == m.selectedRoot:
 			n = tree.FindByPath(m.commitTree, msg.path)
-		} else if idx := findSectionByRoot(m.sections, msg.root); idx >= 0 {
-			n = tree.FindByPath(m.sections[idx].Root, msg.path)
+		case m.mode == ModeBranchDiff && msg.root == m.branchDiff.root && msg.ref == m.branchDiff.ref:
+			n = tree.FindByPath(m.branchDiff.tr, msg.path)
+		default:
+			if idx := findSectionByRoot(m.sections, msg.root); idx >= 0 {
+				n = tree.FindByPath(m.sections[idx].Root, msg.path)
+			}
 		}
 		if n != nil && !n.IsDir {
 			prevY := m.cursorY()
@@ -657,6 +691,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.vp.SetYOffset(m.vp.YOffset + delta)
 			}
 		}
+		return m, nil
+
+	case branchListMsg:
+		if m.mode != ModeBranchPicker || msg.root != m.branchPicker.root {
+			return m, nil // stale
+		}
+		m.branchPicker.loaded = true
+		m.branchPicker.err = msg.err
+		m.branchPicker.all = msg.branches
+		m.refilterBranches()
+		m.refreshView()
+		return m, nil
+
+	case branchTreeMsg:
+		if m.mode != ModeBranchDiff || msg.root != m.branchDiff.root || msg.ref != m.branchDiff.ref {
+			return m, nil // stale
+		}
+		if msg.err != nil {
+			m.err = msg.err
+			return m, nil
+		}
+		m.err = nil
+		m.branchDiff.tr = msg.tr
+		m.cursor = 0
+		m.refreshView()
 		return m, nil
 
 	case searchPathsMsg:
@@ -822,6 +881,34 @@ func (m *Model) applyInitData(msg initDataMsg) {
 	}
 }
 
+// dropSection removes the section at idx and adjusts activeWT so it still
+// points at a valid section (or 0 if the list is now empty). Used when a
+// worktree disappears externally — its status reload fails with a missing
+// directory and the UI cleans up rather than parking the section in an
+// "(error)" state forever. Note: the watcher goroutine for the removed root
+// is not stopped here; further RefreshMsgs for it are dropped by the
+// findSectionByRoot guard in the statusMsg handler.
+func (m *Model) dropSection(idx int) {
+	if idx < 0 || idx >= len(m.sections) {
+		return
+	}
+	m.sections = append(m.sections[:idx], m.sections[idx+1:]...)
+	switch {
+	case len(m.sections) == 0:
+		m.activeWT = 0
+	case m.activeWT > idx:
+		m.activeWT--
+	case m.activeWT == idx && m.activeWT >= len(m.sections):
+		m.activeWT = len(m.sections) - 1
+	}
+	// Cursor was anchored to a row in the now-removed section. refreshView
+	// will clamp m.cursor to len(rows)-1 if it overshoots, but that lands
+	// the cursor on a semantically unrelated row. Resetting to 0 puts it
+	// at a predictable position (first header of the next section).
+	m.cursor = 0
+	m.diffCursor = -1
+}
+
 // preserveTreeState copies expand state and cached hunks from old to new
 // keyed by Path, so a refresh doesn't drop the user's open files or flicker.
 func preserveTreeState(old, new *tree.Node) {
@@ -874,9 +961,23 @@ func (m *Model) refreshExpandedHunks() tea.Cmd {
 			visit(n)
 		}
 	}
-	if m.mode == ModeCommit && m.selectedRoot != "" && m.commitTree != nil {
+	switch {
+	case m.mode == ModeCommit && m.selectedRoot != "" && m.commitTree != nil:
 		walk(m.selectedRoot, m.selectedSHA, m.commitTree)
-	} else {
+	case m.mode == ModeBranchDiff && m.branchDiff.root != "" && m.branchDiff.tr != nil:
+		// Branch-diff uses a different hunk loader; walk the tree and queue
+		// per-file ref-hunk loads inline rather than reusing the closure.
+		var visit func(*tree.Node)
+		visit = func(n *tree.Node) {
+			if !n.IsDir && n.Expanded && n.File != nil && !n.File.Binary {
+				cmds = append(cmds, loadBranchHunksCmd(m.branchDiff.root, m.branchDiff.ref, n.Path))
+			}
+			for _, c := range n.Children {
+				visit(c)
+			}
+		}
+		visit(m.branchDiff.tr)
+	default:
 		for _, s := range m.sections {
 			walk(s.WT.Root, "", s.Root)
 		}
@@ -966,6 +1067,13 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleKeySearch(msg)
 	}
 
+	if m.mode == ModeBranchPicker {
+		if msg.Type == tea.KeyCtrlC {
+			return m, tea.Quit
+		}
+		return m.handleKeyBranchPicker(msg)
+	}
+
 	// Filter-editing gate: while typing in the filter input, swallow keys
 	// other than Ctrl+C (still quits) so global bindings like `q` and `r`
 	// don't fire mid-pattern. Same shape as the ModeSearch gate above —
@@ -998,7 +1106,12 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.mode == ModeFileLog {
 			return *m, m.exitFileLog()
 		}
+		if m.mode == ModeBranchDiff {
+			return *m, m.exitBranchDiff()
+		}
 		return *m, nil
+	case key.Matches(msg, keys.Branches):
+		return *m, m.enterBranchPicker()
 	}
 
 	if m.mode == ModeLog || m.mode == ModeFileLog {
@@ -1583,6 +1696,10 @@ func (m *Model) refreshCmd() tea.Cmd {
 		if m.selectedSHA != "" {
 			return loadCommitTreeCmd(m.selectedRoot, m.selectedSHA)
 		}
+	case ModeBranchDiff:
+		if m.branchDiff.ref != "" {
+			return loadBranchTreeCmd(m.branchDiff.root, m.branchDiff.ref)
+		}
 	}
 	return nil
 }
@@ -1800,6 +1917,9 @@ func (m *Model) toggleNode(r treeRow) tea.Cmd {
 	n.Loading = true
 	m.refreshViewToCursor()
 	root := m.rootForRowSection(r.sectionIdx)
+	if m.mode == ModeBranchDiff {
+		return loadBranchHunksCmd(m.branchDiff.root, m.branchDiff.ref, n.Path)
+	}
 	return loadHunksCmd(root, n.Path, *n.File, m.selectedSHA)
 }
 
@@ -1967,6 +2087,10 @@ func (m *Model) refreshView() {
 		m.vp.SetContent(m.renderSearch())
 		return
 	}
+	if m.mode == ModeBranchPicker {
+		m.vp.SetContent(m.renderBranchPicker())
+		return
+	}
 	if m.mode == ModeFileLog {
 		if m.commitCursor >= len(m.commits) {
 			m.commitCursor = len(m.commits) - 1
@@ -1993,6 +2117,9 @@ func (m *Model) flattenForView() []displayRow {
 	matcher := m.filter.matcher
 	if m.mode == ModeCommit {
 		return flattenCommitTreeFiltered(m.commitTree, matcher)
+	}
+	if m.mode == ModeBranchDiff {
+		return flattenCommitTreeFiltered(m.branchDiff.tr, matcher)
 	}
 	return flattenSectionsFiltered(m.sections, m.showSectionHeaders(), matcher)
 }
@@ -2212,6 +2339,14 @@ func (m Model) header() string {
 		crumb := dimStyle.Render("search")
 		return lipgloss.JoinHorizontal(lipgloss.Left, title, " ", crumb)
 	}
+	if m.mode == ModeBranchPicker {
+		crumb := dimStyle.Render("branch picker")
+		return lipgloss.JoinHorizontal(lipgloss.Left, title, " ", crumb)
+	}
+	if m.mode == ModeBranchDiff {
+		crumb := dimStyle.Render(m.branchDiff.ref + "...HEAD")
+		return lipgloss.JoinHorizontal(lipgloss.Left, title, " ", crumb)
+	}
 	repo := dimStyle.Render(m.repoRoot)
 	return lipgloss.JoinHorizontal(lipgloss.Left, title, " ", repo)
 }
@@ -2243,15 +2378,24 @@ func (m Model) footer() string {
 		left := fmt.Sprintf("[file log] %d commits · %s", len(m.commits), m.fileLogPath)
 		return helpStyle.Render(left + wtCrumb + " · enter open · esc back · ? help")
 	}
+	if m.mode == ModeBranchPicker {
+		n := len(m.branchPicker.filtered)
+		left := fmt.Sprintf("[branch picker] %d / %d", n, len(m.branchPicker.all))
+		return helpStyle.Render(left + " · ↑/↓ select · ⏎ diff · esc cancel · ? help")
+	}
 
-	// ModeChanged / ModeAll / ModeCommit all show file count + adds/dels totals.
+	// ModeChanged / ModeAll / ModeCommit / ModeBranchDiff all show file count + adds/dels totals.
 	files, adds, dels := m.aggregateRowStats()
 	totals := addsStyle.Render(fmt.Sprintf("+%d", adds)) + " " + delsStyle.Render(fmt.Sprintf("-%d", dels))
 	var left, hint string
-	if m.mode == ModeCommit {
+	switch m.mode {
+	case ModeCommit:
 		left = fmt.Sprintf("[commit %s] %d files", m.selectedShort, files)
 		hint = wtCrumb + " · esc back · ? help"
-	} else {
+	case ModeBranchDiff:
+		left = fmt.Sprintf("[branch %s...HEAD] %d files", m.branchDiff.ref, files)
+		hint = wtCrumb + " · esc back · ? help"
+	default:
 		left = fmt.Sprintf("[%s] %d changed", m.mode.String(), files)
 		hint = wtCrumb + " · a toggle · ? help"
 	}
@@ -2295,9 +2439,15 @@ func (m Model) tabHint() string {
 }
 
 func (m Model) aggregateRowStats() (files, adds, dels int) {
-	if m.mode == ModeCommit {
-		if m.commitTree != nil {
-			adds, dels = m.commitTree.Adds, m.commitTree.Dels
+	if m.mode == ModeCommit || m.mode == ModeBranchDiff {
+		var root *tree.Node
+		if m.mode == ModeCommit {
+			root = m.commitTree
+		} else {
+			root = m.branchDiff.tr
+		}
+		if root != nil {
+			adds, dels = root.Adds, root.Dels
 		}
 		for _, r := range m.rows {
 			if t, ok := r.(treeRow); ok && t.node != nil && !t.node.IsDir && t.node.File != nil {
@@ -2326,6 +2476,12 @@ func (m *Model) renderBody() string {
 		}
 		if m.mode == ModeCommit {
 			return dimStyle.Render("  loading commit…")
+		}
+		if m.mode == ModeBranchDiff {
+			if m.branchDiff.tr == nil {
+				return dimStyle.Render("  loading branch diff…")
+			}
+			return dimStyle.Render("  no differences vs " + m.branchDiff.ref)
 		}
 		return dimStyle.Render("  no changes")
 	}
@@ -2563,7 +2719,8 @@ func (m *Model) renderHelpBody() string {
 		}},
 		{"Modes", []row{
 			{"a", "cycle view: changed → all → log"},
-			{"esc / backspace", "back out of commit or file history"},
+			{"B", "branch diff — pick a ref to diff <ref>...HEAD"},
+			{"esc / backspace", "back out of commit, file history, or branch diff"},
 		}},
 		{"Drag & drop", []row{
 			{"drop file", "import into repo with destination prompt"},

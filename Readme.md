@@ -12,6 +12,7 @@ A focused terminal UI for browsing your working-tree git diff as a sparse, colla
 - **Nested repos & submodules** — any independent git repo or submodule discovered under the working tree becomes its own section with its own branch, status, and watcher. Monorepo-style layouts with a frontend / backend split, or projects pulling in submodules, show up correctly without launching gdui separately in each.
 - **Live updates** — fsnotify-backed file watcher refreshes the tree on disk changes (200 ms debounce), and refreshes the log view when a new commit lands. Useful when an agent is editing files or committing in another pane.
 - **Three view modes** — cycle with <kbd>a</kbd> between *changed only*, *all tracked files*, and *commit log*; pick a commit to drill into its file tree.
+- **Branch diff** — press <kbd>B</kbd> to open a branch picker, type to filter local + remote refs, <kbd>enter</kbd> to view the file tree of `<branch>...HEAD` (PR-style merge-base diff) using the same inline-diff pipeline as the working tree.
 - **Per-file history** — press <kbd>b</kbd> on any file to list every commit that touched it (renames followed via `git log --follow`); <kbd>enter</kbd> drills into a commit's diff.
 - **Tree filter** — press <kbd>f</kbd> to narrow the tree by substring, glob (`*.go`), or full regex (`re:^cmd/`); applies across every linked worktree at once.
 - **Drag-and-drop import** — drop files from Finder/Files/Explorer onto the window; a one-line prompt lets you pick the destination inside the repo, then copies atomically. Cursor lands on the new file once the tree reloads.
@@ -106,10 +107,11 @@ The binary is named `gdui` rather than `gd` because `gd` is a common alias for `
 | `ctrl+u` / `ctrl+d`          | page up / down                        |
 | `a`                          | cycle view: changed → all → log       |
 | `b`                          | file history (on a file row)          |
+| `B`                          | branch diff — pick a ref to view `<ref>...HEAD` |
 | `/`                          | open full-text search                 |
 | `f`                          | filter tree (substring / glob / `re:` regex) |
-| `tab` / `⇧tab`               | cycle active worktree (in log / file-history mode) |
-| `esc` / `backspace`          | back out of a commit, or out of file history |
+| `tab` / `⇧tab`               | next / prev section header (worktrees & nested repos), or active worktree in log / file-history |
+| `esc` / `backspace`          | back out of a commit, file history, or branch diff |
 | `r`                          | refresh manually                      |
 | `?`                          | toggle help                           |
 | `q` / `ctrl+c`               | quit                                  |
@@ -126,9 +128,17 @@ Press <kbd>a</kbd> to cycle:
 
 From *changed* or *all*, press <kbd>b</kbd> on any file row to open a **file history** view — the commits that touched that file (renames followed via `git log --follow`). <kbd>enter</kbd> drills into a commit; <kbd>esc</kbd> returns to the file history, then again to the tree.
 
+### Branch diff
+
+Press <kbd>B</kbd> from a tree view to open the **branch picker** — an overlay listing local and remote branches (`refs/heads/` + `refs/remotes/`, symbolic aliases like `origin/HEAD → main` filtered out). Type to narrow case-insensitively, <kbd>↑</kbd> / <kbd>↓</kbd> to move, <kbd>enter</kbd> to select, <kbd>esc</kbd> to cancel.
+
+Selecting a branch enters **branch-diff mode** — a sparse file tree of `git diff <ref>...HEAD` (PR-style: the merge-base form, so you see what HEAD adds on top of the common ancestor with the picked branch, not divergence on the branch's side). The tree, syntax-highlighted inline diffs, filter, and search all behave exactly like the working-tree view. <kbd>esc</kbd> returns to the mode you came from.
+
+The picker is scoped to the cursor's owning section in multi-worktree views, so picking a branch in a nested repo diffs against that repo's HEAD — not the parent's.
+
 ### Multi-worktree
 
-If the repo has linked worktrees (`git worktree add …`), each one renders as its own collapsible section in the same pane, ordered by `git worktree list`. The launch directory's worktree is the initial *active* one — it determines which section the cursor opens on, and which worktree's data is shown in the log / commit / file-history modes. Use <kbd>tab</kbd> / <kbd>⇧tab</kbd> there to cycle the active worktree without leaving the mode.
+If the repo has linked worktrees (`git worktree add …`), each one renders as its own collapsible section in the same pane, ordered by `git worktree list`. The launch directory's worktree is the initial *active* one — it determines which section the cursor opens on, and which worktree's data is shown in the log / commit / file-history modes. Use <kbd>tab</kbd> / <kbd>⇧tab</kbd> to jump between section headers in the tree view, or to cycle the active worktree in log / file-history mode.
 
 The file watcher runs once per worktree, so a save in any of them refreshes only the affected section. The tree filter (<kbd>f</kbd>) applies across all sections simultaneously, so you can spot a file by name regardless of which worktree it lives in.
 
