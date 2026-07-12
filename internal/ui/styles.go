@@ -10,6 +10,7 @@ var (
 	addsStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#9ece6a"))
 	delsStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#f7768e"))
 	dimStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#565f89"))
+	warnStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#e0af68"))
 	errStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#f7768e"))
 	helpStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#565f89"))
 	toastStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#9ece6a")).Bold(true)

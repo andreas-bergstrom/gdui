@@ -23,6 +23,36 @@ func TestBuild_AggregatesAddsAndDels(t *testing.T) {
 	}
 }
 
+func TestBuild_AggregatesChangedFiles(t *testing.T) {
+	root := Build(sample())
+	if root.ChangedFiles != 4 {
+		t.Fatalf("root ChangedFiles = %d, want 4", root.ChangedFiles)
+	}
+	src := FindByPath(root, "src/foo/bar")
+	if src == nil || src.ChangedFiles != 2 {
+		t.Fatalf("src/foo/bar ChangedFiles = %v, want 2", src)
+	}
+	leaf := FindByPath(root, "README.md")
+	if leaf == nil || leaf.ChangedFiles != 1 {
+		t.Fatalf("leaf ChangedFiles = %v, want 1", leaf)
+	}
+}
+
+func TestBuildAll_ChangedFilesExcludesUnchanged(t *testing.T) {
+	changed := []git.ChangedFile{
+		{Path: "src/main.go", Kind: git.Modified, Adds: 2, Dels: 1},
+	}
+	all := []string{"src/main.go", "src/util.go", "README.md"}
+	root := BuildAll(changed, all)
+	src := FindByPath(root, "src")
+	if src == nil || src.ChangedFiles != 1 {
+		t.Fatalf("src ChangedFiles = %v, want 1 (util.go unchanged)", src)
+	}
+	if root.ChangedFiles != 1 {
+		t.Fatalf("root ChangedFiles = %d, want 1", root.ChangedFiles)
+	}
+}
+
 func TestBuild_DirsBeforeFiles(t *testing.T) {
 	root := Build(sample())
 	// At root level, we have docs/, src/, README.md after collapsing — dirs first.

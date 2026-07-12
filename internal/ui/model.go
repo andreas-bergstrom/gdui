@@ -217,16 +217,22 @@ type initDataMsg struct {
 }
 
 type sectionStatus struct {
-	files []git.ChangedFile
-	tree  *tree.Node
-	err   error
+	files         []git.ChangedFile
+	tree          *tree.Node
+	unpushed      map[string]bool
+	unpushedCount int
+	hasRemotes    bool
+	err           error
 }
 
 type statusMsg struct {
-	root  string
-	files []git.ChangedFile
-	tree  *tree.Node
-	err   error
+	root          string
+	files         []git.ChangedFile
+	tree          *tree.Node
+	unpushed      map[string]bool
+	unpushedCount int
+	hasRemotes    bool
+	err           error
 }
 
 type logMsg struct {
@@ -246,6 +252,10 @@ type logMsg struct {
 	// avoid accidental cross-talk.
 	dest logDest
 	err  error
+	// Push status, populated only on page-1 section loads (skip==0).
+	unpushed      map[string]bool
+	unpushedCount int
+	hasRemotes    bool
 }
 
 type logDest int
@@ -368,7 +378,11 @@ func nestedChildPathsMap(all []git.Worktree, nested map[string]bool) map[string]
 func loadStatusCmd(root string, allMode bool, excludeRelPaths []string) tea.Cmd {
 	return func() tea.Msg {
 		st := loadSectionStatus(root, allMode, excludeRelPaths)
-		return statusMsg{root: root, files: st.files, tree: st.tree, err: st.err}
+		return statusMsg{
+			root: root, files: st.files, tree: st.tree,
+			unpushed: st.unpushed, unpushedCount: st.unpushedCount, hasRemotes: st.hasRemotes,
+			err: st.err,
+		}
 	}
 }
 
@@ -383,15 +397,20 @@ func loadSectionStatus(root string, allMode bool, excludeRelPaths []string) sect
 		return sectionStatus{err: err}
 	}
 	files = filterChangedFiles(files, excludeRelPaths)
+	unpushed, count, _ := git.Unpushed(root)
+	hasRemotes := git.HasRemotes(root)
 	if !allMode {
-		return sectionStatus{files: files, tree: tree.Build(files)}
+		return sectionStatus{files: files, tree: tree.Build(files),
+			unpushed: unpushed, unpushedCount: count, hasRemotes: hasRemotes}
 	}
 	all, err := git.ListAll(root)
 	if err != nil {
-		return sectionStatus{files: files, err: err}
+		return sectionStatus{files: files, err: err,
+			unpushed: unpushed, unpushedCount: count, hasRemotes: hasRemotes}
 	}
 	all = filterPaths(all, excludeRelPaths)
-	return sectionStatus{files: files, tree: tree.BuildAll(files, all)}
+	return sectionStatus{files: files, tree: tree.BuildAll(files, all),
+		unpushed: unpushed, unpushedCount: count, hasRemotes: hasRemotes}
 }
 
 // filterChangedFiles removes entries whose Path equals any excludePath (or
@@ -441,7 +460,14 @@ func pathExcluded(p string, excludePaths []string) bool {
 func loadLogCmd(root string, skip, gen int) tea.Cmd {
 	return func() tea.Msg {
 		c, err := git.Log(root, logPageSize, skip)
-		return logMsg{root: root, skip: skip, gen: gen, commits: c, err: err, dest: logDestSection}
+		m := logMsg{root: root, skip: skip, gen: gen, commits: c, err: err, dest: logDestSection}
+		if skip == 0 {
+			// Refresh push status on page-1 loads so ModeLog marks stay current
+			// after a commit made while viewing the log.
+			m.unpushed, m.unpushedCount, _ = git.Unpushed(root)
+			m.hasRemotes = git.HasRemotes(root)
+		}
+		return m
 	}
 }
 
@@ -601,6 +627,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		s.Files = msg.files
 		s.Root = msg.tree
+		s.UnpushedSHAs = msg.unpushed
+		s.UnpushedCount = msg.unpushedCount
+		s.HasRemotes = msg.hasRemotes
 		s.LoadErr = nil
 		if !s.firstLoadDone {
 			s.firstLoadDone = true
@@ -662,6 +691,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		prevAnchor := m.cursorAnchor()
 		if msg.skip == 0 {
 			s.LogCommits = msg.commits
+			s.UnpushedSHAs = msg.unpushed
+			s.UnpushedCount = msg.unpushedCount
+			s.HasRemotes = msg.hasRemotes
 		} else {
 			// Defensive: only append when the offset matches what we've
 			// already loaded. Anything else means the load order skewed
@@ -901,6 +933,9 @@ func (m *Model) applyInitData(msg initDataMsg) {
 		}
 		s.Files = st.files
 		s.Root = st.tree
+		s.UnpushedSHAs = st.unpushed
+		s.UnpushedCount = st.unpushedCount
+		s.HasRemotes = st.hasRemotes
 		s.LoadErr = st.err
 		if !s.firstLoadDone {
 			s.firstLoadDone = true
@@ -2231,7 +2266,7 @@ func (m *Model) renderLogRows() string {
 			if row.idx < 0 || row.idx >= len(s.LogCommits) {
 				continue
 			}
-			line := m.fitWidth(m.renderCommitRowAt(i, s.LogCommits[row.idx]))
+			line := m.fitWidth(m.renderCommitRowAt(i, s.LogCommits[row.idx], s.WT.Root))
 			b.WriteString(m.zones.Mark(commitZoneID(row.sectionIdx, row.idx), line))
 		}
 		b.WriteByte('\n')
@@ -2286,13 +2321,31 @@ func (m *Model) renderLogSectionHeader(rowIdx, sectionIdx int) string {
 // renderCommitRowAt formats a single commit row at the given m.rows index.
 // Separate from renderCommitRow (which uses m.commitCursor for highlight)
 // so the unified-rows path stays consistent with tree-mode rendering.
-func (m *Model) renderCommitRowAt(rowIdx int, c git.Commit) string {
+// root is the owning section's worktree root, used to look up push status.
+func (m *Model) renderCommitRowAt(rowIdx int, c git.Commit, root string) string {
+	mark := m.commitPushMarker(root, c.SHA)
 	sha := addsStyle.Render(c.ShortSHA)
 	date := dimStyle.Render(c.Date)
 	author := dimStyle.Render(truncate(c.Author, 14))
 	subj := fileStyle.Render(c.Subject)
-	row := fmt.Sprintf("%s  %s  %s  %s", sha, date, author, subj)
+	row := fmt.Sprintf("%s%s  %s  %s  %s", mark, sha, date, author, subj)
 	return m.applyCursor(row, rowIdx == m.cursor)
+}
+
+// commitPushMarker returns a leading 2-column marker for a commit row: a
+// warn-styled "⇡" when the commit is unpushed (present in the owning section's
+// UnpushedSHAs and the repo has a remote), or two spaces otherwise so SHAs stay
+// column-aligned. Returns two spaces when no section owns root.
+func (m *Model) commitPushMarker(root, sha string) string {
+	idx := findSectionByRoot(m.sections, root)
+	if idx < 0 {
+		return "  "
+	}
+	s := m.sections[idx]
+	if s.HasRemotes && s.UnpushedSHAs[sha] {
+		return warnStyle.Render("⇡") + " "
+	}
+	return "  "
 }
 
 func (m *Model) ensureCursorVisible() {
@@ -2423,7 +2476,8 @@ func (m Model) footer() string {
 			}
 		}
 		left := fmt.Sprintf("[log] %d commits in %d sections", loaded, sections)
-		return helpStyle.Render(left+" · enter open · tab next section · a toggle · ? help") +
+		return helpStyle.Render(left) + m.unpushedCrumb() +
+			helpStyle.Render(" · enter open · tab next section · a toggle · ? help") +
 			helpStyle.Render(m.tabHint())
 	}
 	if m.mode == ModeFileLog {
@@ -2451,7 +2505,7 @@ func (m Model) footer() string {
 		left = fmt.Sprintf("[%s] %d changed", m.mode.String(), files)
 		hint = wtCrumb + " · a toggle · ? help"
 	}
-	return helpStyle.Render(left+" · ") + totals + helpStyle.Render(hint)
+	return helpStyle.Render(left+" · ") + totals + m.unpushedCrumb() + helpStyle.Render(hint)
 }
 
 // worktreeCrumb formats " · [worktree: <name>]" when there's more than one
@@ -2481,6 +2535,23 @@ func (m Model) worktreeCrumb() string {
 		return ""
 	}
 	return " · [worktree: " + name + "]"
+}
+
+// unpushedCrumb returns a warn-styled " · ⇡N unpushed" fragment summing
+// UnpushedCount across sections that have a remote. Returns "" when nothing is
+// unpushed or no section has a remote, so local-only / fully-pushed repos stay
+// uncluttered.
+func (m Model) unpushedCrumb() string {
+	total := 0
+	for _, s := range m.sections {
+		if s.HasRemotes {
+			total += s.UnpushedCount
+		}
+	}
+	if total == 0 {
+		return ""
+	}
+	return helpStyle.Render(" · ") + warnStyle.Render(fmt.Sprintf("⇡%d unpushed", total))
 }
 
 func (m Model) tabHint() string {
@@ -2597,11 +2668,12 @@ func (m *Model) fitLines(block string) string {
 }
 
 func (m *Model) renderCommitRow(i int, c git.Commit) string {
+	mark := m.commitPushMarker(m.logRoot, c.SHA)
 	sha := addsStyle.Render(c.ShortSHA)
 	date := dimStyle.Render(c.Date)
 	author := dimStyle.Render(truncate(c.Author, 14))
 	subj := fileStyle.Render(c.Subject)
-	row := fmt.Sprintf("%s  %s  %s  %s", sha, date, author, subj)
+	row := fmt.Sprintf("%s%s  %s  %s  %s", mark, sha, date, author, subj)
 	return m.applyCursor(row, i == m.commitCursor)
 }
 
@@ -2654,6 +2726,9 @@ func (m *Model) renderTreeRow(i int, n *tree.Node) string {
 	counts := ""
 	if n.Adds > 0 || n.Dels > 0 {
 		counts = " " + addsStyle.Render(fmt.Sprintf("+%d", n.Adds)) + " " + delsStyle.Render(fmt.Sprintf("-%d", n.Dels))
+	}
+	if n.IsDir && n.ChangedFiles > 0 {
+		counts = " " + dimStyle.Render(fmt.Sprintf("(%d)", n.ChangedFiles)) + counts
 	}
 	row := fmt.Sprintf("%s%s %s", indent, chev, name) + counts
 	return m.applyCursor(row, i == m.cursor)
@@ -2823,7 +2898,8 @@ func (m *Model) renderHelpBody() string {
 	return out
 }
 
-func zoneID(i int) string             { return fmt.Sprintf("row-%d", i) }
+func zoneID(i int) string { return fmt.Sprintf("row-%d", i) }
+
 // commitZoneID identifies a commit row for mouse hit-testing. In ModeLog
 // the unified row list may carry commits from multiple sections, so the
 // section index is part of the key; in ModeFileLog (single-section flat

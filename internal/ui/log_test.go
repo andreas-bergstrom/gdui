@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/andreas-bergstrom/gdui/internal/git"
@@ -67,6 +68,71 @@ func TestFlattenSectionsLogs_CollapsedSectionEmitsOnlyHeader(t *testing.T) {
 	}
 	if c, ok := rows[2].(commitRow); !ok || c.sectionIdx != 1 {
 		t.Errorf("row[2] = %+v, want commit from section 1", rows[2])
+	}
+}
+
+func TestCommitPushMarker(t *testing.T) {
+	s := &WorktreeSection{
+		WT:           git.Worktree{Root: "/repo", Branch: "main"},
+		HasRemotes:   true,
+		UnpushedSHAs: map[string]bool{"unpushed-sha": true},
+	}
+	m := &Model{sections: []*WorktreeSection{s}}
+
+	if got := m.commitPushMarker("/repo", "unpushed-sha"); !strings.Contains(got, "⇡") {
+		t.Errorf("unpushed commit marker = %q, want to contain ⇡", got)
+	}
+	if got := m.commitPushMarker("/repo", "pushed-sha"); strings.Contains(got, "⇡") {
+		t.Errorf("pushed commit marker = %q, want no ⇡", got)
+	}
+	// No remotes → never marked, even if in the set.
+	s.HasRemotes = false
+	if got := m.commitPushMarker("/repo", "unpushed-sha"); strings.Contains(got, "⇡") {
+		t.Errorf("no-remote marker = %q, want no ⇡", got)
+	}
+	// Unknown root → two spaces, no panic.
+	if got := m.commitPushMarker("/other", "unpushed-sha"); strings.Contains(got, "⇡") {
+		t.Errorf("unknown-root marker = %q, want no ⇡", got)
+	}
+}
+
+func TestRenderCommitRowAt_ShowsUnpushedMarker(t *testing.T) {
+	s := &WorktreeSection{
+		WT:           git.Worktree{Root: "/repo", Branch: "main"},
+		HasRemotes:   true,
+		UnpushedSHAs: map[string]bool{"aaa": true},
+	}
+	m := &Model{sections: []*WorktreeSection{s}, width: 80, cursor: -1}
+	unpushed := m.renderCommitRowAt(0, git.Commit{SHA: "aaa", ShortSHA: "aaa", Subject: "local"}, "/repo")
+	if !strings.Contains(unpushed, "⇡") {
+		t.Errorf("unpushed row = %q, want ⇡ marker", unpushed)
+	}
+	pushed := m.renderCommitRowAt(1, git.Commit{SHA: "bbb", ShortSHA: "bbb", Subject: "remote"}, "/repo")
+	if strings.Contains(pushed, "⇡") {
+		t.Errorf("pushed row = %q, want no ⇡ marker", pushed)
+	}
+}
+
+func TestUnpushedCrumb(t *testing.T) {
+	a := &WorktreeSection{HasRemotes: true, UnpushedCount: 2}
+	b := &WorktreeSection{HasRemotes: true, UnpushedCount: 3}
+	m := Model{sections: []*WorktreeSection{a, b}}
+	if got := m.unpushedCrumb(); !strings.Contains(got, "⇡5 unpushed") {
+		t.Errorf("crumb = %q, want ⇡5 unpushed", got)
+	}
+
+	// All pushed → empty crumb.
+	a.UnpushedCount, b.UnpushedCount = 0, 0
+	if got := m.unpushedCrumb(); got != "" {
+		t.Errorf("crumb with 0 unpushed = %q, want empty", got)
+	}
+
+	// Unpushed exists but no remotes → suppressed.
+	a.UnpushedCount = 4
+	a.HasRemotes = false
+	b.HasRemotes = false
+	if got := m.unpushedCrumb(); got != "" {
+		t.Errorf("crumb with no remotes = %q, want empty", got)
 	}
 }
 

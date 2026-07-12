@@ -180,6 +180,37 @@ func CommitFiles(repoRoot, sha string) ([]ChangedFile, error) {
 	return files, nil
 }
 
+// Unpushed returns the set of commit SHAs on HEAD that are not reachable from
+// any remote-tracking ref, plus the count. Uses `git rev-list HEAD --not
+// --remotes`. A non-zero git exit (e.g. unborn HEAD) yields an empty set and a
+// nil error — the push indicator is advisory and must never break the log or
+// footer.
+func Unpushed(repoRoot string) (map[string]bool, int, error) {
+	out, err := exec.Command("git", "-C", repoRoot,
+		"rev-list", "HEAD", "--not", "--remotes").Output()
+	if err != nil {
+		return map[string]bool{}, 0, nil
+	}
+	set := make(map[string]bool)
+	for _, sha := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if sha != "" {
+			set[sha] = true
+		}
+	}
+	return set, len(set), nil
+}
+
+// HasRemotes reports whether the repo has any configured remote. Used to
+// suppress the push indicator in local-only repos, where every commit would
+// otherwise count as unpushed.
+func HasRemotes(repoRoot string) bool {
+	out, err := exec.Command("git", "-C", repoRoot, "remote").Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) != ""
+}
+
 func kindFromStatusLetter(c byte) ChangeKind {
 	switch c {
 	case 'A':

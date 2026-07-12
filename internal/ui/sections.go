@@ -48,11 +48,19 @@ type WorktreeSection struct {
 	// (manual refresh, watcher commit) so stale in-flight pages from a
 	// superseded generation are silently dropped — closes the
 	// pagination-during-refresh race.
-	LogCommits    []git.Commit
-	LogLoaded     bool
-	LogLoading    bool
-	LogHasMore    bool
-	LogReloadGen  int
+	LogCommits   []git.Commit
+	LogLoaded    bool
+	LogLoading   bool
+	LogHasMore   bool
+	LogReloadGen int
+
+	// Push status: SHAs on HEAD not reachable from any remote-tracking ref,
+	// plus a cached count and whether the repo has any remote at all. Refreshed
+	// on every status load and on page-1 log loads. HasRemotes gates the whole
+	// indicator so local-only repos stay clean.
+	UnpushedSHAs  map[string]bool
+	UnpushedCount int
+	HasRemotes    bool
 }
 
 // displayRow is a row in the unified row list rendered by Model.View.

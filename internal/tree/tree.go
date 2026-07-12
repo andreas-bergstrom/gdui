@@ -8,19 +8,20 @@ import (
 )
 
 type Node struct {
-	Name        string
-	Path        string
-	IsDir       bool
-	Parent      *Node
-	Children    []*Node
-	File        *git.ChangedFile // nil for unchanged files in "all" mode
-	Adds        int
-	Dels        int
-	Expanded    bool
-	Hunks       []git.Hunk
-	Loading     bool
-	LoadErr     error
-	Interesting bool // dir contains a changed descendant, or file is itself changed
+	Name         string
+	Path         string
+	IsDir        bool
+	Parent       *Node
+	Children     []*Node
+	File         *git.ChangedFile // nil for unchanged files in "all" mode
+	Adds         int
+	Dels         int
+	ChangedFiles int // count of changed files at/under this node
+	Expanded     bool
+	Hunks        []git.Hunk
+	Loading      bool
+	LoadErr      error
+	Interesting  bool // dir contains a changed descendant, or file is itself changed
 }
 
 // Build constructs a sparse tree containing only changed paths.
@@ -147,17 +148,18 @@ func collapseChains(n *Node) {
 	}
 }
 
-func aggregate(n *Node) (adds, dels int) {
+func aggregate(n *Node) (adds, dels, files int) {
 	if !n.IsDir && n.File != nil {
-		n.Adds, n.Dels = n.File.Adds, n.File.Dels
-		return n.Adds, n.Dels
+		n.Adds, n.Dels, n.ChangedFiles = n.File.Adds, n.File.Dels, 1
+		return n.Adds, n.Dels, n.ChangedFiles
 	}
 	for _, c := range n.Children {
-		a, d := aggregate(c)
+		a, d, f := aggregate(c)
 		adds += a
 		dels += d
+		files += f
 	}
-	n.Adds, n.Dels = adds, dels
+	n.Adds, n.Dels, n.ChangedFiles = adds, dels, files
 	return
 }
 

@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -147,6 +148,132 @@ func TestLog_SkipReturnsOlderCommits(t *testing.T) {
 	}
 	if len(none) != 0 {
 		t.Errorf("skip=100 should return empty, got %d", len(none))
+	}
+}
+
+func TestUnpushed_TracksRemoteReachability(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git not in PATH: %v", err)
+	}
+	root := resolveTempRoot(t)
+	repo := filepath.Join(root, "repo")
+	bare := filepath.Join(root, "remote.git")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	env := append(os.Environ(),
+		"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com",
+		"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com",
+	)
+	run := func(dir string, args ...string) error {
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = env
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("git %v: %v: %s", args, err, out)
+		}
+		return nil
+	}
+	mustRun := func(dir string, args ...string) {
+		if err := run(dir, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	mustRun(root, "init", "-q", "--bare", "-b", "main", bare)
+	mustRun(repo, "init", "-q", "-b", "main")
+
+	// No remote configured yet.
+	if HasRemotes(repo) {
+		t.Fatal("HasRemotes should be false before adding a remote")
+	}
+
+	// First commit, unpushed.
+	if err := os.WriteFile(filepath.Join(repo, "a"), []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustRun(repo, "add", "a")
+	mustRun(repo, "commit", "-q", "-m", "first")
+	mustRun(repo, "remote", "add", "origin", bare)
+
+	if !HasRemotes(repo) {
+		t.Fatal("HasRemotes should be true after adding a remote")
+	}
+	set, count, err := Unpushed(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 || len(set) != 1 {
+		t.Fatalf("before push: count=%d set=%v, want 1", count, set)
+	}
+
+	// Push → nothing unpushed.
+	mustRun(repo, "push", "-q", "origin", "main")
+	set, count, err = Unpushed(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 || len(set) != 0 {
+		t.Fatalf("after push: count=%d set=%v, want 0", count, set)
+	}
+
+	// New local commit is unpushed again, and its SHA is in the set.
+	if err := os.WriteFile(filepath.Join(repo, "b"), []byte("b"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustRun(repo, "add", "b")
+	mustRun(repo, "commit", "-q", "-m", "second")
+	head, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.TrimSpace(string(head))
+	set, count, err = Unpushed(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 || !set[sha] {
+		t.Fatalf("after new commit: count=%d, set[%s]=%v", count, sha, set[sha])
+	}
+}
+
+func TestUnpushed_NoRemotesNoError(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git not in PATH: %v", err)
+	}
+	root := resolveTempRoot(t)
+	repo := filepath.Join(root, "local")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	env := append(os.Environ(),
+		"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com",
+		"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com",
+	)
+	mustRun := func(args ...string) {
+		cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+		cmd.Env = env
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	mustRun("init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "a"), []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustRun("add", "a")
+	mustRun("commit", "-q", "-m", "first")
+
+	if HasRemotes(repo) {
+		t.Fatal("HasRemotes should be false for a repo with no remotes")
+	}
+	// With no remotes, every HEAD commit is "unpushed" — the UI suppresses the
+	// indicator via HasRemotes, but Unpushed itself must not error.
+	_, count, err := Unpushed(repo)
+	if err != nil {
+		t.Fatalf("Unpushed errored: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("count=%d, want 1 (no remotes → all unpushed)", count)
 	}
 }
 
