@@ -91,9 +91,9 @@ func startWatchers(root string, prog *tea.Program) []func() {
 	}
 	// Append nested repos (independent or submodules) discovered under each
 	// known worktree so they get their own watcher and refresh in isolation.
-	// Watchers ignore events outside their own root (internal/watch/watch.go
-	// shouldIgnore), so the parent watcher will not fire for writes inside a
-	// nested repo — those route only to that nested repo's section.
+	// A parent watcher never registers directories that carry their own
+	// .git entry (internal/watch/watch.go addRecursive), so writes inside a
+	// nested repo or in-tree linked worktree route only to that section.
 	all := append([]git.Worktree(nil), wts...)
 	all = append(all, git.DiscoverNestedReposRecursive(wts, 0)...)
 	stops := make([]func(), 0, len(all))

@@ -126,7 +126,7 @@ func TestAddRecursive_SkipsNestedRepoRoots(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer w.Close()
-	addRecursive(w, root)
+	addRecursive(w, root, root)
 
 	watched := map[string]bool{}
 	for _, p := range w.WatchList() {
@@ -141,6 +141,46 @@ func TestAddRecursive_SkipsNestedRepoRoots(t *testing.T) {
 	for _, no := range []string{filepath.Join(".claude", "worktrees", "inner"), filepath.Join(".claude", "worktrees", "inner", "src")} {
 		if watched[no] {
 			t.Errorf("nested repo dir %q must not be watched by the parent; got %v", no, watched)
+		}
+	}
+}
+
+// The Create handler in run() re-enters addRecursive with the *created*
+// directory as the walk start. The nested-repo skip must key off the
+// section's own root, not the walk start, or a worktree added while gdui is
+// running lands in the parent's watch list.
+func TestAddRecursive_CreatePathSkipsNestedRepoRoot(t *testing.T) {
+	root := t.TempDir()
+	mustMkdir(t, filepath.Join(root, ".git"))
+	inner := filepath.Join(root, ".claude", "worktrees", "inner")
+	mustMkdir(t, filepath.Join(inner, "src"))
+	if err := os.WriteFile(filepath.Join(inner, ".git"), []byte("gitdir: /elsewhere\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	plain := filepath.Join(root, "newdir")
+	mustMkdir(t, filepath.Join(plain, "sub"))
+
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	addRecursive(w, root, inner) // simulates Create of the inner worktree dir
+	addRecursive(w, root, plain) // simulates Create of an ordinary dir
+
+	watched := map[string]bool{}
+	for _, p := range w.WatchList() {
+		rel, _ := filepath.Rel(root, p)
+		watched[rel] = true
+	}
+	for _, no := range []string{filepath.Join(".claude", "worktrees", "inner"), filepath.Join(".claude", "worktrees", "inner", "src")} {
+		if watched[no] {
+			t.Errorf("created nested repo dir %q must not be watched; got %v", no, watched)
+		}
+	}
+	for _, want := range []string{"newdir", filepath.Join("newdir", "sub")} {
+		if !watched[want] {
+			t.Errorf("created ordinary dir %q should be watched; got %v", want, watched)
 		}
 	}
 }

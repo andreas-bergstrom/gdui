@@ -19,9 +19,8 @@ func TestNestedChildPathsMap_BasicAttachment(t *testing.T) {
 		{Root: a},
 		{Root: b},
 	}
-	nested := map[string]bool{a: true, b: true}
 
-	got := nestedChildPathsMap(all, nested)
+	got := nestedChildPathsMap(all)
 
 	// Both should attach to /repo (the only non-nested ancestor in the set).
 	// Slash normalization: git status emits forward slashes, so we expect
@@ -44,9 +43,8 @@ func TestNestedChildPathsMap_NestedInsideNestedAttachesToClosest(t *testing.T) {
 		{Root: a},
 		{Root: inner},
 	}
-	nested := map[string]bool{a: true, inner: true}
 
-	got := nestedChildPathsMap(all, nested)
+	got := nestedChildPathsMap(all)
 	want := map[string][]string{
 		parent: {"nested-a"},
 		a:      {"inner"},
@@ -56,11 +54,25 @@ func TestNestedChildPathsMap_NestedInsideNestedAttachesToClosest(t *testing.T) {
 	}
 }
 
-func TestNestedChildPathsMap_NoNestedReposReturnsEmpty(t *testing.T) {
-	all := []git.Worktree{{Root: "/repo"}, {Root: "/repo/wt-feat"}}
-	got := nestedChildPathsMap(all, map[string]bool{})
+func TestNestedChildPathsMap_DisjointRootsReturnsEmpty(t *testing.T) {
+	all := []git.Worktree{{Root: "/repo"}, {Root: "/elsewhere/wt-feat"}}
+	got := nestedChildPathsMap(all)
 	if len(got) != 0 {
 		t.Errorf("expected empty map, got %v", got)
+	}
+}
+
+// A linked worktree that lives inside the main worktree (e.g. Claude Code's
+// <repo>/.claude/worktrees/<name>) is not "nested" in the discovery sense,
+// but git still reports it to the parent as an opaque untracked directory.
+// It must attach to its parent exactly like a discovered nested repo so the
+// parent's Changed and All trees exclude it.
+func TestNestedChildPathsMap_InTreeLinkedWorktreeAttaches(t *testing.T) {
+	all := []git.Worktree{{Root: "/repo"}, {Root: "/repo/.claude/worktrees/x"}}
+	got := nestedChildPathsMap(all)
+	want := map[string][]string{"/repo": {".claude/worktrees/x"}}
+	if len(got) != 1 || len(got["/repo"]) != 1 || got["/repo"][0] != want["/repo"][0] {
+		t.Errorf("got %v, want %v", got, want)
 	}
 }
 
@@ -75,9 +87,7 @@ func TestNestedChildPathsMap_PrefixOnSeparatorBoundary(t *testing.T) {
 		{Root: other},
 		{Root: nestedChild},
 	}
-	nested := map[string]bool{nestedChild: true}
-
-	got := nestedChildPathsMap(all, nested)
+	got := nestedChildPathsMap(all)
 	// nestedChild lives under /repo/sub-extra (which itself is in `all`),
 	// NOT under /repo/sub. So the attachment must go to /repo/sub-extra.
 	want := map[string][]string{other: {"inner"}}
@@ -121,6 +131,7 @@ func TestPathExcluded(t *testing.T) {
 	}{
 		{"nested-a", true},          // exact match
 		{"nested-a/file.txt", true}, // descendant
+		{"nested-a/", true},         // opaque-dir form git emits for a nested repo
 		{"nested-a.txt", false},     // sibling that shares prefix bytes
 		{"sub/nested-b", true},
 		{"sub/nested-b/x", true},

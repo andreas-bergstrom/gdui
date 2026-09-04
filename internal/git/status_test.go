@@ -2,17 +2,40 @@ package git
 
 import "testing"
 
-func TestParsePorcelainV2_DropsUntrackedNestedRepoDirs(t *testing.T) {
-	// git emits a nested repo / linked worktree inside the tree as a single
-	// untracked entry with a trailing slash, even under --untracked-files=all,
-	// because it refuses to descend into it. Such an entry is not a file and
-	// must not become a tree leaf.
-	out := []byte("? .claude/worktrees/inner/\x00? foo.txt\x00")
+func TestParsePorcelainV2_Records(t *testing.T) {
+	out := []byte("1 .M N... 100644 100644 100644 aaaa bbbb b.txt\x00" +
+		"2 R. N... 100644 100644 100644 cccc dddd R100 new.txt\x00old.txt\x00" +
+		"? foo.txt\x00")
 	files := parsePorcelainV2(out)
-	if len(files) != 1 {
-		t.Fatalf("want 1 file, got %d: %+v", len(files), files)
+	if len(files) != 3 {
+		t.Fatalf("want 3 files, got %d: %+v", len(files), files)
 	}
-	if files[0].Path != "foo.txt" || files[0].Kind != Untracked {
-		t.Errorf("got %+v", files[0])
+	if files[0].Path != "b.txt" || files[0].Kind != Modified {
+		t.Errorf("ordinary: %+v", files[0])
+	}
+	if files[1].Path != "new.txt" || files[1].OldPath != "old.txt" || files[1].Kind != Renamed {
+		t.Errorf("rename: %+v", files[1])
+	}
+	if files[2].Path != "foo.txt" || files[2].Kind != Untracked {
+		t.Errorf("untracked: %+v", files[2])
+	}
+}
+
+func TestParsePorcelainV2_UntrackedPathsPreservedByteForByte(t *testing.T) {
+	// The parser must not editorialise paths. A nested repo / in-tree linked
+	// worktree arrives as an opaque directory with a trailing slash — the UI
+	// layer (nestedChildPathsMap + filterChangedFiles) is what drops it, so
+	// only repos that actually own a section disappear from the parent.
+	// A filename that is itself whitespace ("foo/ ") must survive untouched.
+	out := []byte("? .claude/worktrees/inner/\x00? foo/ \x00")
+	files := parsePorcelainV2(out)
+	if len(files) != 2 {
+		t.Fatalf("want 2 files, got %d: %+v", len(files), files)
+	}
+	if files[0].Path != ".claude/worktrees/inner/" {
+		t.Errorf("trailing-slash entry mangled: %q", files[0].Path)
+	}
+	if files[1].Path != "foo/ " {
+		t.Errorf("whitespace basename mangled: %q", files[1].Path)
 	}
 }

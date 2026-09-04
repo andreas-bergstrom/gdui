@@ -27,7 +27,7 @@ func Start(repoRoot string, debounce time.Duration, onChange func()) (stop func(
 		return func() {}
 	}
 
-	addRecursive(w, repoRoot)
+	addRecursive(w, repoRoot, repoRoot)
 	headLogPath := resolveHeadLogPath(repoRoot)
 	if headLogPath != "" {
 		_ = w.Add(filepath.Dir(headLogPath))
@@ -83,7 +83,7 @@ func run(w *fsnotify.Watcher, repoRoot, headLogPath string, debounce time.Durati
 			// Newly created directories: start watching them too.
 			if ev.Op&fsnotify.Create != 0 {
 				if info, err := os.Stat(ev.Name); err == nil && info.IsDir() {
-					addRecursive(w, ev.Name)
+					addRecursive(w, repoRoot, ev.Name)
 				}
 			}
 			if timer == nil {
@@ -113,8 +113,12 @@ func timerC(t *time.Timer) <-chan time.Time {
 	return t.C
 }
 
-func addRecursive(w *fsnotify.Watcher, root string) {
-	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+// addRecursive registers every directory under start with the watcher.
+// repoRoot is the section's own root — the one directory allowed to contain
+// a .git entry — and is distinct from start because the Create handler in
+// run() re-enters here with the newly created directory as start.
+func addRecursive(w *fsnotify.Watcher, repoRoot, start string) {
+	_ = filepath.WalkDir(start, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
@@ -129,7 +133,7 @@ func addRecursive(w *fsnotify.Watcher, root string) {
 		// for a linked worktree or submodule) is a separate repo with its
 		// own watcher — don't recurse, or every save inside it would also
 		// refresh this section.
-		if path != root {
+		if path != repoRoot {
 			if _, err := os.Lstat(filepath.Join(path, ".git")); err == nil {
 				return filepath.SkipDir
 			}

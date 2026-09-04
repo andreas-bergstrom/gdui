@@ -319,7 +319,7 @@ func loadInitDataCmd(repoRoot string, allMode bool) tea.Cmd {
 		// parent's status excludes its nested repos (otherwise git would
 		// surface them as opaque untracked directories, polluting the
 		// parent's tree).
-		childPaths := nestedChildPathsMap(all, nested)
+		childPaths := nestedChildPathsMap(all)
 		statuses := map[string]sectionStatus{}
 		for _, wt := range all {
 			statuses[wt.Root] = loadSectionStatus(wt.Root, allMode, childPaths[wt.Root])
@@ -329,11 +329,12 @@ func loadInitDataCmd(repoRoot string, allMode bool) tea.Cmd {
 }
 
 // nestedChildPathsMap returns, for each worktree root, the list of paths
-// (relative to that root) of nested repos that live directly inside it.
-// Nested-inside-nested repos attach to the innermost parent. Used to filter
-// each section's ChangedFile list so a nested-repo directory doesn't appear
-// as an untracked entry in its parent's tree.
-func nestedChildPathsMap(all []git.Worktree, nested map[string]bool) map[string][]string {
+// (relative to that root) of other sections that live directly inside it —
+// discovered nested repos and in-tree linked worktrees alike. Repos nested
+// several levels deep attach to the innermost parent. Used to filter each
+// section's ChangedFile and ListAll paths so a child repo's directory doesn't
+// appear as an opaque untracked entry in its parent's tree.
+func nestedChildPathsMap(all []git.Worktree) map[string][]string {
 	out := map[string][]string{}
 	// Collect candidate parent roots (everything that could host a nested
 	// repo — both linked worktrees and nested repos that have repos
@@ -343,9 +344,6 @@ func nestedChildPathsMap(all []git.Worktree, nested map[string]bool) map[string]
 		parents = append(parents, filepath.Clean(w.Root))
 	}
 	for _, w := range all {
-		if !nested[w.Root] {
-			continue
-		}
 		childAbs := filepath.Clean(w.Root)
 		// Pick the longest parent path that's a strict ancestor of this
 		// nested root — that's the section this child should attach to.
@@ -912,7 +910,7 @@ func (m *Model) applyInitData(msg initDataMsg) {
 	// Refresh the parent→nested-children map so per-section refreshes
 	// (RefreshMsg-driven) can keep filtering nested-repo dirs out of their
 	// parent's status.
-	m.nestedChildren = nestedChildPathsMap(msg.worktrees, msg.nested)
+	m.nestedChildren = nestedChildPathsMap(msg.worktrees)
 	newSecs := make([]*WorktreeSection, 0, len(msg.worktrees))
 	for _, wt := range msg.worktrees {
 		st := msg.statuses[wt.Root]

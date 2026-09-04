@@ -72,11 +72,13 @@ func parsePorcelainV2(out []byte) []ChangedFile {
 			i += 2
 		case '?':
 			// ? path
-			path := strings.TrimSpace(strings.TrimPrefix(rec, "?"))
-			// A trailing slash marks a nested repo or linked worktree git
-			// won't descend into (even with --untracked-files=all). It's
-			// not a file; nested repos get their own section instead.
-			if path != "" && !strings.HasSuffix(path, "/") {
+			// Strip exactly the "? " prefix — TrimSpace would eat a
+			// whitespace-only basename. A path ending in "/" is a nested
+			// repo or in-tree linked worktree git won't descend into; the
+			// UI drops those via nestedChildPathsMap so only directories
+			// that own a section vanish from the parent.
+			path := strings.TrimPrefix(rec, "? ")
+			if path != "" {
 				files = append(files, ChangedFile{Path: path, Kind: Untracked})
 			}
 			i++
