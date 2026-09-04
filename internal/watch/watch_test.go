@@ -1,8 +1,11 @@
 package watch
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 func TestShouldIgnore_GitDir(t *testing.T) {
@@ -104,5 +107,47 @@ func TestShouldIgnore_PathsOutsideRepoRootAreIgnored(t *testing.T) {
 	repo := "/repo"
 	if !shouldIgnore(repo, "/elsewhere/file.go", "") {
 		t.Error("path outside repoRoot should be ignored")
+	}
+}
+
+func TestAddRecursive_SkipsNestedRepoRoots(t *testing.T) {
+	root := t.TempDir()
+	mustMkdir(t, filepath.Join(root, "src"))
+	mustMkdir(t, filepath.Join(root, ".git"))
+	// A linked worktree (or nested repo) inside the tree: `.git` is a file.
+	inner := filepath.Join(root, ".claude", "worktrees", "inner")
+	mustMkdir(t, filepath.Join(inner, "src"))
+	if err := os.WriteFile(filepath.Join(inner, ".git"), []byte("gitdir: /elsewhere\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	addRecursive(w, root)
+
+	watched := map[string]bool{}
+	for _, p := range w.WatchList() {
+		rel, _ := filepath.Rel(root, p)
+		watched[rel] = true
+	}
+	for _, want := range []string{".", "src", ".claude", filepath.Join(".claude", "worktrees")} {
+		if !watched[want] {
+			t.Errorf("expected %q to be watched; got %v", want, watched)
+		}
+	}
+	for _, no := range []string{filepath.Join(".claude", "worktrees", "inner"), filepath.Join(".claude", "worktrees", "inner", "src")} {
+		if watched[no] {
+			t.Errorf("nested repo dir %q must not be watched by the parent; got %v", no, watched)
+		}
+	}
+}
+
+func mustMkdir(t *testing.T, p string) {
+	t.Helper()
+	if err := os.MkdirAll(p, 0o755); err != nil {
+		t.Fatal(err)
 	}
 }

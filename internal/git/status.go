@@ -38,7 +38,11 @@ func porcelainV2(repoRoot string) ([]ChangedFile, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parsePorcelainV2(out), nil
+}
 
+// parsePorcelainV2 parses NUL-separated `git status --porcelain=v2 -z` output.
+func parsePorcelainV2(out []byte) []ChangedFile {
 	var files []ChangedFile
 	records := splitNUL(out)
 	i := 0
@@ -69,7 +73,10 @@ func porcelainV2(repoRoot string) ([]ChangedFile, error) {
 		case '?':
 			// ? path
 			path := strings.TrimSpace(strings.TrimPrefix(rec, "?"))
-			if path != "" {
+			// A trailing slash marks a nested repo or linked worktree git
+			// won't descend into (even with --untracked-files=all). It's
+			// not a file; nested repos get their own section instead.
+			if path != "" && !strings.HasSuffix(path, "/") {
 				files = append(files, ChangedFile{Path: path, Kind: Untracked})
 			}
 			i++
@@ -77,7 +84,7 @@ func porcelainV2(repoRoot string) ([]ChangedFile, error) {
 			i++
 		}
 	}
-	return files, nil
+	return files
 }
 
 func parseOrdinary(rec string) *ChangedFile {

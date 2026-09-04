@@ -125,6 +125,15 @@ func addRecursive(w *fsnotify.Watcher, root string) {
 		if base == ".git" || base == "node_modules" || base == "vendor" {
 			return filepath.SkipDir
 		}
+		// A subdirectory with its own `.git` (dir for a nested repo, file
+		// for a linked worktree or submodule) is a separate repo with its
+		// own watcher — don't recurse, or every save inside it would also
+		// refresh this section.
+		if path != root {
+			if _, err := os.Lstat(filepath.Join(path, ".git")); err == nil {
+				return filepath.SkipDir
+			}
+		}
 		_ = w.Add(path)
 		return nil
 	})
