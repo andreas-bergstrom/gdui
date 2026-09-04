@@ -9,7 +9,8 @@ import (
 
 // RevertFile reverts a single file in worktree `root` to its state at HEAD.
 //
-//	Modified, Deleted   -> git checkout HEAD -- <path>  (discards both staged
+//	Modified, Deleted,
+//	Conflicted          -> git checkout HEAD -- <path>  (discards both staged
 //	                       and unstaged changes in favor of HEAD)
 //	Renamed             -> git checkout HEAD -- <oldPath>; git rm -f -- <newPath>
 //	Added (staged-new)  -> git rm -f -- <path>  (drops index entry + file)
@@ -19,7 +20,7 @@ import (
 // failure (operations are idempotent).
 func RevertFile(root string, f ChangedFile) error {
 	switch f.Kind {
-	case Modified, Deleted:
+	case Modified, Deleted, Conflicted:
 		return runGit(root, "checkout", "HEAD", "--", f.Path)
 	case Renamed:
 		if f.OldPath == "" {

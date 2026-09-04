@@ -39,3 +39,18 @@ func TestParsePorcelainV2_UntrackedPathsPreservedByteForByte(t *testing.T) {
 		t.Errorf("whitespace basename mangled: %q", files[1].Path)
 	}
 }
+
+func TestParsePorcelainV2_UnmergedRecordIsConflicted(t *testing.T) {
+	// "u XY sub m1 m2 m3 mW h1 h2 h3 path" — a file with merge conflicts.
+	out := []byte("u UU N... 100644 100644 100644 100644 7898 ba29 2299 f.txt\x00? other.txt\x00")
+	files := parsePorcelainV2(out)
+	if len(files) != 2 {
+		t.Fatalf("want 2 files, got %d: %+v", len(files), files)
+	}
+	if files[0].Path != "f.txt" || files[0].Kind != Conflicted {
+		t.Errorf("unmerged: %+v", files[0])
+	}
+	if Conflicted.Letter() != "U" {
+		t.Errorf("Conflicted letter = %q, want U", Conflicted.Letter())
+	}
+}

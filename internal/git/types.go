@@ -8,6 +8,7 @@ const (
 	Deleted
 	Renamed
 	Untracked
+	Conflicted // unmerged entry during a merge/rebase/cherry-pick
 )
 
 func (k ChangeKind) Letter() string {
@@ -20,6 +21,8 @@ func (k ChangeKind) Letter() string {
 		return "R"
 	case Untracked:
 		return "?"
+	case Conflicted:
+		return "U"
 	default:
 		return "M"
 	}

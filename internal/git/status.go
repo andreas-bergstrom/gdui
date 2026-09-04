@@ -70,6 +70,12 @@ func parsePorcelainV2(out []byte) []ChangedFile {
 				files = append(files, *f)
 			}
 			i += 2
+		case 'u':
+			// u XY sub m1 m2 m3 mW h1 h2 h3 path
+			if parts := strings.SplitN(rec, " ", 11); len(parts) == 11 {
+				files = append(files, ChangedFile{Path: parts[10], Kind: Conflicted})
+			}
+			i++
 		case '?':
 			// ? path
 			// Strip exactly the "? " prefix — TrimSpace would eat a
